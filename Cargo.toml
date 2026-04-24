@@ -4,6 +4,7 @@ members = [
 	"crates/tool/tool-core",
 	"crates/tool/toolctl",
 	"crates/tool/tool-installer",
+	"crates/migration/upstream-migration-planner",
 ]
 
 [workspace.package]
