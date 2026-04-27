@@ -11,6 +11,7 @@ const BIN_DIR_NAME: &str = "bin";
 const METADATA_DIR_NAME: &str = "installed";
 const REPO_DIR_NAME: &str = "repo";
 const WORKTREES_DIR_NAME: &str = "worktrees";
+const TOOLS_BIN_ENV_VAR: &str = "ON9AU_TOOLS_BIN";
 
 /// Describes where managed binaries and metadata live on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,40 +42,26 @@ impl InstallLayout {
     /// 2. `%LOCALAPPDATA%\\on9au-tools` on Windows
     /// 3. `$XDG_DATA_HOME/on9au-tools` on Unix
     /// 4. `$HOME/.local/share/on9au-tools` on Unix
+    ///
+    /// Managed binaries are installed into:
+    /// 1. `ON9AU_TOOLS_BIN`
+    /// 2. the current executable directory, if it is already on `PATH`
+    /// 3. the Cargo bin directory (typically `~/.cargo/bin`)
     pub fn discover() -> Result<Self> {
-        if let Some(home_dir) = env::var_os("ON9AU_TOOLS_HOME") {
-            return Ok(Self::for_home(PathBuf::from(home_dir)));
-        }
+        let home_dir = resolve_tools_home_dir()?;
+        let bin_dir = resolve_managed_bin_dir()?;
 
-        if cfg!(windows) {
-            if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
-                return Ok(Self::for_home(
-                    PathBuf::from(local_app_data).join(TOOLS_HOME_DIR_NAME),
-                ));
-            }
-        } else {
-            if let Some(xdg_data_home) = env::var_os("XDG_DATA_HOME") {
-                return Ok(Self::for_home(
-                    PathBuf::from(xdg_data_home).join(TOOLS_HOME_DIR_NAME),
-                ));
-            }
-
-            if let Some(home) = env::var_os("HOME") {
-                return Ok(Self::for_home(
-                    PathBuf::from(home)
-                        .join(".local")
-                        .join("share")
-                        .join(TOOLS_HOME_DIR_NAME),
-                ));
-            }
-        }
-
-        bail!("could not determine a tools home directory; set ON9AU_TOOLS_HOME")
+        Ok(Self::for_paths(home_dir, bin_dir))
     }
 
     /// Builds a layout from an explicit home directory.
     pub fn for_home(home_dir: PathBuf) -> Self {
         let bin_dir = home_dir.join(BIN_DIR_NAME);
+        Self::for_paths(home_dir, bin_dir)
+    }
+
+    /// Builds a layout from explicit home and binary directories.
+    pub fn for_paths(home_dir: PathBuf, bin_dir: PathBuf) -> Self {
         let metadata_dir = home_dir.join(METADATA_DIR_NAME);
         let repo_dir = home_dir.join(REPO_DIR_NAME);
         let worktrees_dir = home_dir.join(WORKTREES_DIR_NAME);
@@ -295,9 +282,110 @@ fn copy_binary(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn resolve_tools_home_dir() -> Result<PathBuf> {
+    if let Some(home_dir) = env::var_os("ON9AU_TOOLS_HOME") {
+        return Ok(PathBuf::from(home_dir));
+    }
+
+    if cfg!(windows) {
+        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+            return Ok(PathBuf::from(local_app_data).join(TOOLS_HOME_DIR_NAME));
+        }
+    } else {
+        if let Some(xdg_data_home) = env::var_os("XDG_DATA_HOME") {
+            return Ok(PathBuf::from(xdg_data_home).join(TOOLS_HOME_DIR_NAME));
+        }
+
+        if let Some(home) = env::var_os("HOME") {
+            return Ok(
+                PathBuf::from(home)
+                    .join(".local")
+                    .join("share")
+                    .join(TOOLS_HOME_DIR_NAME),
+            );
+        }
+    }
+
+    bail!("could not determine a tools home directory; set ON9AU_TOOLS_HOME")
+}
+
+fn resolve_managed_bin_dir() -> Result<PathBuf> {
+    if let Some(bin_dir) = env::var_os(TOOLS_BIN_ENV_VAR) {
+        return Ok(PathBuf::from(bin_dir));
+    }
+
+    if let Some(current_exe_bin_dir) = current_exe_bin_dir()? {
+        if is_directory_on_path(&current_exe_bin_dir)
+            && !looks_like_cargo_target_bin_dir(&current_exe_bin_dir)
+        {
+            return Ok(current_exe_bin_dir);
+        }
+    }
+
+    cargo_bin_dir()
+}
+
+fn current_exe_bin_dir() -> Result<Option<PathBuf>> {
+    let current_exe = env::current_exe().context("failed to resolve current executable path")?;
+    Ok(current_exe.parent().map(Path::to_path_buf))
+}
+
+fn cargo_bin_dir() -> Result<PathBuf> {
+    if let Some(cargo_home) = env::var_os("CARGO_HOME") {
+        return Ok(PathBuf::from(cargo_home).join(BIN_DIR_NAME));
+    }
+
+    user_home_dir().map(|home_dir| home_dir.join(".cargo").join(BIN_DIR_NAME))
+}
+
+fn user_home_dir() -> Result<PathBuf> {
+    if let Some(home_dir) = env::var_os("HOME") {
+        return Ok(PathBuf::from(home_dir));
+    }
+
+    if cfg!(windows) {
+        if let Some(user_profile) = env::var_os("USERPROFILE") {
+            return Ok(PathBuf::from(user_profile));
+        }
+    }
+
+    bail!("could not determine a home directory for the Cargo bin path")
+}
+
+fn is_directory_on_path(directory: &Path) -> bool {
+    let Ok(path_value) = env::var_os("PATH").ok_or(()) else {
+        return false;
+    };
+
+    env::split_paths(&path_value).any(|path_entry| same_directory(&path_entry, directory))
+}
+
+fn same_directory(left: &Path, right: &Path) -> bool {
+    match (canonicalize_path(left), canonicalize_path(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn looks_like_cargo_target_bin_dir(directory: &Path) -> bool {
+    matches!(
+        (directory.file_name(), directory.parent().and_then(Path::file_name)),
+        (Some(profile), Some(parent))
+            if matches!(profile.to_str(), Some("debug" | "release"))
+                && parent == "target"
+    )
+}
+
+fn canonicalize_path(path: &Path) -> Option<PathBuf> {
+    path.canonicalize().ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{InstallLayout, display_name, install_binary_file, with_exe_suffix};
+    use super::{
+        InstallLayout, display_name, install_binary_file, is_directory_on_path,
+        looks_like_cargo_target_bin_dir, same_directory, with_exe_suffix,
+    };
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -371,6 +459,34 @@ mod tests {
         assert_eq!(fs::read(&destination).unwrap(), b"hello world");
 
         fs::remove_dir_all(layout.home_dir()).unwrap();
+    }
+
+    #[test]
+    fn for_paths_uses_explicit_bin_directory() {
+        let layout = InstallLayout::for_paths(
+            PathBuf::from("/tmp/on9au-home"),
+            PathBuf::from("/tmp/shared-bin"),
+        );
+
+        assert_eq!(layout.home_dir(), Path::new("/tmp/on9au-home"));
+        assert_eq!(layout.bin_dir(), Path::new("/tmp/shared-bin"));
+    }
+
+    #[test]
+    fn same_directory_matches_identical_paths() {
+        assert!(same_directory(Path::new("/tmp/example"), Path::new("/tmp/example")));
+    }
+
+    #[test]
+    fn missing_path_variable_is_not_treated_as_on_path() {
+        assert!(!is_directory_on_path(Path::new("/tmp/example-that-probably-is-not-on-path")));
+    }
+
+    #[test]
+    fn cargo_target_bin_directory_is_rejected_as_managed_bin_target() {
+        assert!(looks_like_cargo_target_bin_dir(Path::new("target/debug")));
+        assert!(looks_like_cargo_target_bin_dir(Path::new("target/release")));
+        assert!(!looks_like_cargo_target_bin_dir(Path::new(".cargo/bin")));
     }
 
     fn unique_temp_path(prefix: &str) -> PathBuf {

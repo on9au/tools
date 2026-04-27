@@ -25,12 +25,20 @@ For this repo, the practical model is:
 
 ## Managed install root
 
-The binaries are installed into:
+Tool state is stored under:
 
 - Windows: `%LOCALAPPDATA%\on9au-tools\bin`
 - Unix: `$XDG_DATA_HOME/on9au-tools/bin`
 - Fallback on Unix: `$HOME/.local/share/on9au-tools/bin`
 - Override on all platforms: `ON9AU_TOOLS_HOME`
+
+Managed binaries are installed into a PATH-friendly directory instead of the tool state directory:
+
+- `ON9AU_TOOLS_BIN`, if you set it
+- otherwise the directory containing `toolctl`, if that directory is already on `PATH`
+- otherwise the Cargo bin directory, typically `$HOME/.cargo/bin` or `%USERPROFILE%\.cargo\bin`
+
+That means installed tools should be directly invokable from your shell without going through `toolctl run`.
 
 ## Commands
 
