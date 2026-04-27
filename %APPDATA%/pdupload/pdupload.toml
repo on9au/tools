@@ -1,5 +1,0 @@
-source = "https://proget.wtg.zone/nuget/wtg-packaging-tmp/v3/index.json"
-api_key = "595e099461bed72a0128de0e504ac22a312a2429"
-directories = ["bin/nuget", "package"]
-version_suffix = ""
-skip_duplicate = true
