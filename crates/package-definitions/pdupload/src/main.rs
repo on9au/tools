@@ -53,6 +53,9 @@ struct Cli {
     /// Passing `--version-suffix` with no value defaults to `pre.<yyyyMMdd>.<token>`.
     #[arg(long, num_args = 0..=1, require_equals = true)]
     version_suffix: Option<Option<String>>,
+    /// Override the prefix version used when composing a suffix-based package version.
+    #[arg(long)]
+    prefix_version: Option<String>,
     /// Skip duplicate packages when the feed already contains the package.
     #[arg(long)]
     skip_duplicate: bool,
@@ -78,7 +81,10 @@ struct PackageIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum VersionRewrite {
     Exact(String),
-    Suffix(String),
+    Suffix {
+        prefix_version: Option<String>,
+        suffix: String,
+    },
 }
 
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
@@ -88,6 +94,7 @@ struct PduploadConfig {
     directories: Option<Vec<PathBuf>>,
     package_version: Option<String>,
     version_suffix: Option<String>,
+    prefix_version: Option<String>,
     skip_duplicate: Option<bool>,
     dry_run: Option<bool>,
 }
@@ -199,13 +206,14 @@ fn candidate_config_paths() -> Vec<PathBuf> {
 
 fn global_config_path() -> Option<PathBuf> {
     if cfg!(windows)
-        && let Some(app_data) = env::var_os("APPDATA") {
-            return Some(
-                PathBuf::from(app_data)
-                    .join(DEFAULT_CONFIG_DIRECTORY_NAME)
-                    .join(DEFAULT_CONFIG_FILE_NAME),
-            );
-        }
+        && let Some(app_data) = env::var_os("APPDATA")
+    {
+        return Some(
+            PathBuf::from(app_data)
+                .join(DEFAULT_CONFIG_DIRECTORY_NAME)
+                .join(DEFAULT_CONFIG_FILE_NAME),
+        );
+    }
 
     if let Some(xdg_config_home) = env::var_os("XDG_CONFIG_HOME") {
         return Some(
@@ -545,6 +553,10 @@ fn validate_version_arguments(cli: &Cli) -> Result<()> {
         bail!("--package-version and --version-suffix are mutually exclusive")
     }
 
+    if cli.package_version.is_some() && cli.prefix_version.is_some() {
+        bail!("--package-version and --prefix-version are mutually exclusive")
+    }
+
     Ok(())
 }
 
@@ -556,9 +568,21 @@ fn resolve_version_rewrite(
         return Ok(Some(VersionRewrite::Exact(package_version.clone())));
     }
 
+    let prefix_version = cli.prefix_version.clone();
+
     match &cli.version_suffix {
-        Some(Some(suffix)) => Ok(Some(VersionRewrite::Suffix(suffix.clone()))),
-        Some(None) => Ok(Some(VersionRewrite::Suffix(default_version_suffix()?))),
+        Some(Some(suffix)) => Ok(Some(VersionRewrite::Suffix {
+            prefix_version,
+            suffix: suffix.clone(),
+        })),
+        Some(None) => Ok(Some(VersionRewrite::Suffix {
+            prefix_version,
+            suffix: default_version_suffix()?,
+        })),
+        None if prefix_version.is_some() => Ok(Some(VersionRewrite::Suffix {
+            prefix_version,
+            suffix: default_version_suffix()?,
+        })),
         None => resolve_version_rewrite_from_config(config),
     }
 }
@@ -570,16 +594,35 @@ fn resolve_version_rewrite_from_config(
         return Ok(None);
     };
 
-    match (&config.package_version, &config.version_suffix) {
-        (Some(_), Some(_)) => {
+    match (
+        &config.package_version,
+        &config.version_suffix,
+        &config.prefix_version,
+    ) {
+        (Some(_), Some(_), _) => {
             bail!("config file cannot set both package_version and version_suffix")
         }
-        (Some(package_version), None) => Ok(Some(VersionRewrite::Exact(package_version.clone()))),
-        (None, Some(version_suffix)) if version_suffix.trim().is_empty() => {
-            Ok(Some(VersionRewrite::Suffix(default_version_suffix()?)))
+        (Some(_), _, Some(_)) => {
+            bail!("config file cannot set both package_version and prefix_version")
         }
-        (None, Some(version_suffix)) => Ok(Some(VersionRewrite::Suffix(version_suffix.clone()))),
-        (None, None) => Ok(None),
+        (Some(package_version), None, None) => {
+            Ok(Some(VersionRewrite::Exact(package_version.clone())))
+        }
+        (None, Some(version_suffix), prefix_version) if version_suffix.trim().is_empty() => {
+            Ok(Some(VersionRewrite::Suffix {
+                prefix_version: prefix_version.clone(),
+                suffix: default_version_suffix()?,
+            }))
+        }
+        (None, Some(version_suffix), prefix_version) => Ok(Some(VersionRewrite::Suffix {
+            prefix_version: prefix_version.clone(),
+            suffix: version_suffix.clone(),
+        })),
+        (None, None, Some(prefix_version)) => Ok(Some(VersionRewrite::Suffix {
+            prefix_version: Some(prefix_version.clone()),
+            suffix: default_version_suffix()?,
+        })),
+        (None, None, None) => Ok(None),
     }
 }
 
@@ -589,8 +632,13 @@ fn resolve_package_version(
 ) -> Result<String> {
     match version_rewrite {
         VersionRewrite::Exact(version) => Ok(version.clone()),
-        VersionRewrite::Suffix(suffix) => {
-            let prefix = version_prefix(current_version);
+        VersionRewrite::Suffix {
+            prefix_version,
+            suffix,
+        } => {
+            let prefix = prefix_version
+                .as_deref()
+                .unwrap_or_else(|| version_prefix(current_version));
             Ok(format!("{prefix}-{suffix}"))
         }
     }
@@ -725,6 +773,7 @@ mod tests {
             directories: Vec::new(),
             package_version: None,
             version_suffix: None,
+            prefix_version: None,
             skip_duplicate: false,
             dry_run: false,
         }
@@ -774,11 +823,36 @@ mod tests {
 
         let rewritten = rewrite_nuspec_version(
             nuspec.as_bytes(),
-            &VersionRewrite::Suffix("pre.20260427".to_string()),
+            &VersionRewrite::Suffix {
+                prefix_version: None,
+                suffix: "pre.20260427".to_string(),
+            },
         )
         .unwrap();
 
         assert_eq!(rewritten.identity.version, "1.0.0-pre.20260427");
+    }
+
+    #[test]
+    fn rewritten_nuspec_can_use_explicit_prefix_version_with_suffix() {
+        let nuspec = r#"<?xml version="1.0"?>
+<package>
+  <metadata>
+    <id>Example.Package</id>
+    <version>1.0.0-alpha.4</version>
+  </metadata>
+</package>"#;
+
+        let rewritten = rewrite_nuspec_version(
+            nuspec.as_bytes(),
+            &VersionRewrite::Suffix {
+                prefix_version: Some("2.1.0".to_string()),
+                suffix: "pre.20260427".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rewritten.identity.version, "2.1.0-pre.20260427");
     }
 
     #[test]
@@ -831,6 +905,7 @@ mod tests {
             directories: Some(vec![temp_dir.path().to_path_buf()]),
             package_version: None,
             version_suffix: Some("ci.4".to_string()),
+            prefix_version: None,
             skip_duplicate: Some(true),
             dry_run: Some(true),
         };
@@ -841,7 +916,10 @@ mod tests {
         assert_eq!(resolved.api_key.as_deref(), Some("secret"));
         assert_eq!(
             resolved.version_rewrite,
-            Some(VersionRewrite::Suffix("ci.4".to_string()))
+            Some(VersionRewrite::Suffix {
+                prefix_version: None,
+                suffix: "ci.4".to_string(),
+            })
         );
         assert!(resolved.skip_duplicate);
         assert!(resolved.dry_run);
@@ -855,6 +933,7 @@ mod tests {
             api_key: Some("cli-key".to_string()),
             directories: vec![temp_dir.path().to_path_buf()],
             package_version: Some("2.0.0".to_string()),
+            prefix_version: None,
             skip_duplicate: true,
             dry_run: true,
             ..cli_with_defaults()
@@ -865,6 +944,7 @@ mod tests {
             directories: None,
             package_version: Some("1.0.0".to_string()),
             version_suffix: None,
+            prefix_version: None,
             skip_duplicate: Some(false),
             dry_run: Some(false),
         };
@@ -889,6 +969,7 @@ mod tests {
             directories: None,
             package_version: Some("1.0.0".to_string()),
             version_suffix: Some("ci.1".to_string()),
+            prefix_version: None,
             skip_duplicate: None,
             dry_run: None,
         };
@@ -906,6 +987,50 @@ mod tests {
         let candidates = candidate_config_paths();
 
         assert_eq!(candidates.first(), Some(&PathBuf::from("pdupload.toml")));
+    }
+
+    #[test]
+    fn config_can_supply_prefix_version_for_suffix_mode() {
+        let config = PduploadConfig {
+            source: None,
+            api_key: None,
+            directories: None,
+            package_version: None,
+            version_suffix: Some("ci.7".to_string()),
+            prefix_version: Some("5.4.3".to_string()),
+            skip_duplicate: None,
+            dry_run: None,
+        };
+
+        let rewrite = resolve_version_rewrite_from_config(Some(&config)).unwrap();
+        assert_eq!(
+            rewrite,
+            Some(VersionRewrite::Suffix {
+                prefix_version: Some("5.4.3".to_string()),
+                suffix: "ci.7".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn config_rejects_conflicting_package_and_prefix_versions() {
+        let config = PduploadConfig {
+            source: None,
+            api_key: None,
+            directories: None,
+            package_version: Some("1.0.0".to_string()),
+            version_suffix: None,
+            prefix_version: Some("2.0.0".to_string()),
+            skip_duplicate: None,
+            dry_run: None,
+        };
+
+        let error = resolve_version_rewrite_from_config(Some(&config)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot set both package_version and prefix_version")
+        );
     }
 
     #[test]

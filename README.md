@@ -112,7 +112,7 @@ It:
 - reads defaults from `pdupload.toml` in the current working directory, then a global config file, or from `--config <path>`
 - lets you override those search roots with repeated `--directory` arguments
 - can rewrite the nuspec version inside each `.nupkg` before upload
-- can rewrite only the prerelease suffix while keeping the package's existing prefix version
+- can rewrite only the prerelease suffix while keeping the package's existing prefix version, or overriding that prefix version explicitly
 - pushes with `dotnet nuget push`
 - defaults `--api-key` from the `packagingFeedKey` environment variable
 
@@ -128,6 +128,12 @@ Suffix-only version rewrite using the package's current prefix version:
 cargo run -p pdupload -- --source MyFeed --version-suffix=ci.4
 ```
 
+Suffix-only version rewrite with an explicit prefix version:
+
+```powershell
+cargo run -p pdupload -- --source MyFeed --prefix-version 2.1.0 --version-suffix=ci.4
+```
+
 Default suffix mode, which uses `(prefix-version)-pre.<yyyyMMdd>.<token>`:
 
 ```powershell
@@ -140,6 +146,7 @@ Config file defaults with CLI overrides:
 source = "MyFeed"
 api_key = "super-secret-key"
 directories = ["bin/nuget", "package"]
+prefix_version = "2.1.0"
 version_suffix = ""
 skip_duplicate = true
 ```
