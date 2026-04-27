@@ -297,12 +297,10 @@ fn resolve_tools_home_dir() -> Result<PathBuf> {
         }
 
         if let Some(home) = env::var_os("HOME") {
-            return Ok(
-                PathBuf::from(home)
-                    .join(".local")
-                    .join("share")
-                    .join(TOOLS_HOME_DIR_NAME),
-            );
+            return Ok(PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join(TOOLS_HOME_DIR_NAME));
         }
     }
 
@@ -474,12 +472,17 @@ mod tests {
 
     #[test]
     fn same_directory_matches_identical_paths() {
-        assert!(same_directory(Path::new("/tmp/example"), Path::new("/tmp/example")));
+        assert!(same_directory(
+            Path::new("/tmp/example"),
+            Path::new("/tmp/example")
+        ));
     }
 
     #[test]
     fn missing_path_variable_is_not_treated_as_on_path() {
-        assert!(!is_directory_on_path(Path::new("/tmp/example-that-probably-is-not-on-path")));
+        assert!(!is_directory_on_path(Path::new(
+            "/tmp/example-that-probably-is-not-on-path"
+        )));
     }
 
     #[test]

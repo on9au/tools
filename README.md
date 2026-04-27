@@ -102,6 +102,43 @@ Run an installed tool through `toolctl`:
 cargo run -p toolctl -- run some-tool -- --help
 ```
 
+## Package tools
+
+`pdupload` helps with the annoying "rename the package version and manually push a pile of nupkgs" workflow.
+
+It:
+
+- scans `bin/nuget` and `package` by default
+- lets you override those search roots with repeated `--directory` arguments
+- can rewrite the nuspec version inside each `.nupkg` before upload
+- can rewrite only the prerelease suffix while keeping the package's existing prefix version
+- pushes with `dotnet nuget push`
+- defaults `--api-key` from the `packagingFeed` environment variable
+
+Example:
+
+```powershell
+cargo run -p pdupload -- --source https://feed.example/v3/index.json --package-version 1.2.3-ci.4
+```
+
+Suffix-only version rewrite using the package's current prefix version:
+
+```powershell
+cargo run -p pdupload -- --source MyFeed --version-suffix=ci.4
+```
+
+Default suffix mode, which uses `(prefix-version)-pre.<yyyyMMdd>`:
+
+```powershell
+cargo run -p pdupload -- --source MyFeed --version-suffix
+```
+
+Custom directories:
+
+```powershell
+cargo run -p pdupload -- --source MyFeed --directory bin/nuget --directory artifacts/packages --skip-duplicate
+```
+
 ## Version model
 
 The version model is repo-native rather than semver-heavy:
