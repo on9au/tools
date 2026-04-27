@@ -109,7 +109,7 @@ cargo run -p toolctl -- run some-tool -- --help
 It:
 
 - scans `bin/nuget` and `package` by default
-- reads defaults from `pdupload.toml` in the current working directory, or from `--config <path>`
+- reads defaults from `pdupload.toml` in the current working directory, then a global config file, or from `--config <path>`
 - lets you override those search roots with repeated `--directory` arguments
 - can rewrite the nuspec version inside each `.nupkg` before upload
 - can rewrite only the prerelease suffix while keeping the package's existing prefix version
@@ -144,7 +144,15 @@ version_suffix = ""
 skip_duplicate = true
 ```
 
-That file is loaded from `pdupload.toml` in the current working directory by default. Command-line arguments still win over config values.
+By default, `pdupload` looks for config in this order:
+
+- `--config <path>` if you pass it
+- `./pdupload.toml`
+- Windows: `%APPDATA%\pdupload\pdupload.toml`
+- Unix: `$XDG_CONFIG_HOME/pdupload/pdupload.toml`
+- Unix fallback: `$HOME/.config/pdupload/pdupload.toml`
+
+Command-line arguments still win over config values.
 
 Custom directories:
 

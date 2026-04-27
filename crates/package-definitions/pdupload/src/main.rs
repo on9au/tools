@@ -1,3 +1,4 @@
+use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
@@ -22,6 +23,7 @@ const DEFAULT_SUFFIX_PREFIX: &str = "pre";
 const DEFAULT_DATE_FORMAT: &[FormatItem<'static>] = format_description!("[year][month][day]");
 const DEFAULT_SUFFIX_TOKEN_WIDTH: usize = 8;
 const DEFAULT_CONFIG_FILE_NAME: &str = "pdupload.toml";
+const DEFAULT_CONFIG_DIRECTORY_NAME: &str = "pdupload";
 
 /// Uploads one or more NuGet packages to a feed, optionally overriding their package version.
 #[derive(Debug, Parser)]
@@ -154,7 +156,7 @@ fn try_main() -> Result<()> {
 fn load_config(cli: &Cli) -> Result<Option<PduploadConfig>> {
     let config_path = match &cli.config {
         Some(path) => Some(path.clone()),
-        None => default_config_path(),
+        None => discover_config_path(),
     };
 
     let Some(config_path) = config_path else {
@@ -179,9 +181,47 @@ fn load_config(cli: &Cli) -> Result<Option<PduploadConfig>> {
     Ok(Some(config))
 }
 
-fn default_config_path() -> Option<PathBuf> {
-    let path = PathBuf::from(DEFAULT_CONFIG_FILE_NAME);
-    path.exists().then_some(path)
+fn discover_config_path() -> Option<PathBuf> {
+    candidate_config_paths()
+        .into_iter()
+        .find(|path| path.exists())
+}
+
+fn candidate_config_paths() -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from(DEFAULT_CONFIG_FILE_NAME)];
+
+    if let Some(global_path) = global_config_path() {
+        candidates.push(global_path);
+    }
+
+    candidates
+}
+
+fn global_config_path() -> Option<PathBuf> {
+    if cfg!(windows) {
+        if let Some(app_data) = env::var_os("APPDATA") {
+            return Some(
+                PathBuf::from(app_data)
+                    .join(DEFAULT_CONFIG_DIRECTORY_NAME)
+                    .join(DEFAULT_CONFIG_FILE_NAME),
+            );
+        }
+    }
+
+    if let Some(xdg_config_home) = env::var_os("XDG_CONFIG_HOME") {
+        return Some(
+            PathBuf::from(xdg_config_home)
+                .join(DEFAULT_CONFIG_DIRECTORY_NAME)
+                .join(DEFAULT_CONFIG_FILE_NAME),
+        );
+    }
+
+    env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".config")
+            .join(DEFAULT_CONFIG_DIRECTORY_NAME)
+            .join(DEFAULT_CONFIG_FILE_NAME)
+    })
 }
 
 fn resolve_options(cli: &Cli, config: Option<&PduploadConfig>) -> Result<ResolvedOptions> {
@@ -668,10 +708,11 @@ struct RewrittenNuspec {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SUFFIX_TOKEN_WIDTH, PackageIdentity, PduploadConfig, VersionRewrite, child_text,
-        default_suffix_token, default_version_suffix, display_paths, is_uploadable_package,
-        package_file_name, resolve_options, resolve_version_rewrite_from_config,
-        rewrite_nuspec_version, version_prefix,
+        DEFAULT_SUFFIX_TOKEN_WIDTH, PackageIdentity, PduploadConfig, VersionRewrite,
+        candidate_config_paths, child_text, default_suffix_token, default_version_suffix,
+        display_paths, global_config_path, is_uploadable_package, package_file_name,
+        resolve_options, resolve_version_rewrite_from_config, rewrite_nuspec_version,
+        version_prefix,
     };
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
@@ -859,5 +900,19 @@ mod tests {
                 .to_string()
                 .contains("cannot set both package_version and version_suffix")
         );
+    }
+
+    #[test]
+    fn candidate_config_paths_start_with_local_file() {
+        let candidates = candidate_config_paths();
+
+        assert_eq!(candidates.first(), Some(&PathBuf::from("pdupload.toml")));
+    }
+
+    #[test]
+    fn global_config_path_uses_platform_convention() {
+        if let Some(path) = global_config_path() {
+            assert!(path.ends_with(Path::new("pdupload/pdupload.toml")));
+        }
     }
 }
