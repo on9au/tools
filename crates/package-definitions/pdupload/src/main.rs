@@ -30,8 +30,8 @@ struct Cli {
     /// NuGet source name or URL to upload packages to.
     #[arg(long, short = 's')]
     source: String,
-    /// API key used by dotnet nuget push. Defaults to the packagingFeed environment variable.
-    #[arg(long, env = "packagingFeed")]
+    /// API key used by dotnet nuget push. Defaults to the packagingFeedKey environment variable.
+    #[arg(long, env = "packagingFeedKey")]
     api_key: Option<String>,
     /// Directory to scan for nupkg files. Repeat to scan multiple roots.
     #[arg(long = "directory", short = 'd')]
@@ -109,7 +109,7 @@ fn try_main() -> Result<()> {
     }
 
     let api_key = cli.api_key.as_deref().ok_or_else(|| {
-        anyhow!("missing API key; pass --api-key or set the packagingFeed environment variable")
+        anyhow!("missing API key; pass --api-key or set the packagingFeedKey environment variable")
     })?;
 
     for upload in &uploads {
