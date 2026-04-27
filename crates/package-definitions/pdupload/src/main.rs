@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process;
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -18,6 +19,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 const DEFAULT_PACKAGE_DIRECTORIES: &[&str] = &["bin/nuget", "package"];
 const DEFAULT_SUFFIX_PREFIX: &str = "pre";
 const DEFAULT_DATE_FORMAT: &[FormatItem<'static>] = format_description!("[year][month][day]");
+const DEFAULT_SUFFIX_TOKEN_WIDTH: usize = 8;
 
 /// Uploads one or more NuGet packages to a feed, optionally overriding their package version.
 #[derive(Debug, Parser)]
@@ -41,7 +43,7 @@ struct Cli {
     package_version: Option<String>,
     /// Rewrite only the package version suffix, preserving the package's current prefix version.
     ///
-    /// Passing `--version-suffix` with no value defaults to `pre.<yyyyMMdd>`.
+    /// Passing `--version-suffix` with no value defaults to `pre.<yyyyMMdd>.<token>`.
     #[arg(long, num_args = 0..=1, require_equals = true)]
     version_suffix: Option<Option<String>>,
     /// Skip duplicate packages when the feed already contains the package.
@@ -432,10 +434,18 @@ fn version_prefix(version: &str) -> &str {
 }
 
 fn default_version_suffix() -> Result<String> {
-    let current_date = OffsetDateTime::now_utc()
+    let current_time = OffsetDateTime::now_utc();
+    let current_date = current_time
         .format(DEFAULT_DATE_FORMAT)
         .context("failed to format the default package version suffix date")?;
-    Ok(format!("{DEFAULT_SUFFIX_PREFIX}.{current_date}"))
+    let token = default_suffix_token(current_time.unix_timestamp_nanos(), process::id());
+    Ok(format!("{DEFAULT_SUFFIX_PREFIX}.{current_date}.{token}"))
+}
+
+fn default_suffix_token(unix_timestamp_nanos: i128, process_id: u32) -> String {
+    let mixed = (unix_timestamp_nanos as u128) ^ u128::from(process_id);
+    let lower_bits = (mixed & 0xffff_ffff) as u32;
+    format!("{lower_bits:0width$x}", width = DEFAULT_SUFFIX_TOKEN_WIDTH)
 }
 
 /// Prints the final set of packages that will be uploaded.
@@ -522,8 +532,9 @@ struct RewrittenNuspec {
 #[cfg(test)]
 mod tests {
     use super::{
-        PackageIdentity, VersionRewrite, child_text, default_version_suffix, display_paths,
-        is_uploadable_package, package_file_name, rewrite_nuspec_version, version_prefix,
+        DEFAULT_SUFFIX_TOKEN_WIDTH, PackageIdentity, VersionRewrite, child_text,
+        default_suffix_token, default_version_suffix, display_paths, is_uploadable_package,
+        package_file_name, rewrite_nuspec_version, version_prefix,
     };
     use std::path::{Path, PathBuf};
     use xmltree::Element;
@@ -604,7 +615,18 @@ mod tests {
     #[test]
     fn default_version_suffix_uses_pre_prefix() {
         let suffix = default_version_suffix().unwrap();
-        assert!(suffix.starts_with("pre."));
-        assert_eq!(suffix.len(), "pre.20260427".len());
+        let parts = suffix.split('.').collect::<Vec<_>>();
+
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], "pre");
+        assert_eq!(parts[1].len(), 8);
+        assert_eq!(parts[2].len(), DEFAULT_SUFFIX_TOKEN_WIDTH);
+    }
+
+    #[test]
+    fn default_suffix_token_is_zero_padded_hex() {
+        let token = default_suffix_token(0x1234_abcd, 0x42);
+        assert_eq!(token.len(), DEFAULT_SUFFIX_TOKEN_WIDTH);
+        assert!(token.chars().all(|character| character.is_ascii_hexdigit()));
     }
 }
