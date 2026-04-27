@@ -198,15 +198,14 @@ fn candidate_config_paths() -> Vec<PathBuf> {
 }
 
 fn global_config_path() -> Option<PathBuf> {
-    if cfg!(windows) {
-        if let Some(app_data) = env::var_os("APPDATA") {
+    if cfg!(windows)
+        && let Some(app_data) = env::var_os("APPDATA") {
             return Some(
                 PathBuf::from(app_data)
                     .join(DEFAULT_CONFIG_DIRECTORY_NAME)
                     .join(DEFAULT_CONFIG_FILE_NAME),
             );
         }
-    }
 
     if let Some(xdg_config_home) = env::var_os("XDG_CONFIG_HOME") {
         return Some(
