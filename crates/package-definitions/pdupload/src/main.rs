@@ -7,6 +7,7 @@ use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use serde::Deserialize;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
@@ -20,6 +21,7 @@ const DEFAULT_PACKAGE_DIRECTORIES: &[&str] = &["bin/nuget", "package"];
 const DEFAULT_SUFFIX_PREFIX: &str = "pre";
 const DEFAULT_DATE_FORMAT: &[FormatItem<'static>] = format_description!("[year][month][day]");
 const DEFAULT_SUFFIX_TOKEN_WIDTH: usize = 8;
+const DEFAULT_CONFIG_FILE_NAME: &str = "pdupload.toml";
 
 /// Uploads one or more NuGet packages to a feed, optionally overriding their package version.
 #[derive(Debug, Parser)]
@@ -29,9 +31,12 @@ const DEFAULT_SUFFIX_TOKEN_WIDTH: usize = 8;
     about = "Upload multiple .nupkg files to a NuGet feed with an optional package version override"
 )]
 struct Cli {
+    /// Path to a TOML config file that supplies default options.
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// NuGet source name or URL to upload packages to.
     #[arg(long, short = 's')]
-    source: String,
+    source: Option<String>,
     /// API key used by dotnet nuget push. Defaults to the packagingFeedKey environment variable.
     #[arg(long, env = "packagingFeedKey")]
     api_key: Option<String>,
@@ -74,6 +79,27 @@ enum VersionRewrite {
     Suffix(String),
 }
 
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+struct PduploadConfig {
+    source: Option<String>,
+    api_key: Option<String>,
+    directories: Option<Vec<PathBuf>>,
+    package_version: Option<String>,
+    version_suffix: Option<String>,
+    skip_duplicate: Option<bool>,
+    dry_run: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedOptions {
+    source: String,
+    api_key: Option<String>,
+    directories: Vec<PathBuf>,
+    version_rewrite: Option<VersionRewrite>,
+    skip_duplicate: bool,
+    dry_run: bool,
+}
+
 fn main() -> ExitCode {
     match try_main() {
         Ok(()) => ExitCode::SUCCESS,
@@ -87,45 +113,132 @@ fn main() -> ExitCode {
 fn try_main() -> Result<()> {
     let cli = Cli::parse();
     validate_version_arguments(&cli)?;
-    let directories = resolve_search_directories(&cli)?;
-    let package_paths = discover_package_paths(&directories)?;
+    let config = load_config(&cli)?;
+    let resolved = resolve_options(&cli, config.as_ref())?;
+    let package_paths = discover_package_paths(&resolved.directories)?;
     if package_paths.is_empty() {
         bail!(
             "no .nupkg files were found under {}",
-            display_paths(&directories)
+            display_paths(&resolved.directories)
         );
     }
 
-    let version_rewrite = version_rewrite_from_cli(&cli)?;
-    let temp_dir = if version_rewrite.is_some() {
+    let temp_dir = if resolved.version_rewrite.is_some() {
         Some(TempDir::new().context("failed to create temporary repack directory")?)
     } else {
         None
     };
 
-    let uploads = prepare_uploads(&package_paths, version_rewrite.as_ref(), temp_dir.as_ref())?;
-    print_upload_plan(&uploads, &cli.source);
+    let uploads = prepare_uploads(
+        &package_paths,
+        resolved.version_rewrite.as_ref(),
+        temp_dir.as_ref(),
+    )?;
+    print_upload_plan(&uploads, &resolved.source);
 
-    if cli.dry_run {
+    if resolved.dry_run {
         return Ok(());
     }
 
-    let api_key = cli.api_key.as_deref().ok_or_else(|| {
+    let api_key = resolved.api_key.as_deref().ok_or_else(|| {
         anyhow!("missing API key; pass --api-key or set the packagingFeedKey environment variable")
     })?;
 
     for upload in &uploads {
-        push_package(upload, &cli.source, api_key, cli.skip_duplicate)?;
+        push_package(upload, &resolved.source, api_key, resolved.skip_duplicate)?;
     }
 
     Ok(())
 }
 
+fn load_config(cli: &Cli) -> Result<Option<PduploadConfig>> {
+    let config_path = match &cli.config {
+        Some(path) => Some(path.clone()),
+        None => default_config_path(),
+    };
+
+    let Some(config_path) = config_path else {
+        return Ok(None);
+    };
+
+    if !config_path.exists() {
+        if cli.config.is_some() {
+            bail!(
+                "configured config file does not exist: {}",
+                config_path.display()
+            );
+        }
+        return Ok(None);
+    }
+
+    let contents = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config = toml::from_str::<PduploadConfig>(&contents)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+
+    Ok(Some(config))
+}
+
+fn default_config_path() -> Option<PathBuf> {
+    let path = PathBuf::from(DEFAULT_CONFIG_FILE_NAME);
+    path.exists().then_some(path)
+}
+
+fn resolve_options(cli: &Cli, config: Option<&PduploadConfig>) -> Result<ResolvedOptions> {
+    let source = cli
+        .source
+        .clone()
+        .or_else(|| config.and_then(|config| config.source.clone()))
+        .ok_or_else(|| anyhow!("missing source; pass --source or set source in pdupload.toml"))?;
+
+    let api_key = cli
+        .api_key
+        .clone()
+        .or_else(|| config.and_then(|config| config.api_key.clone()));
+
+    let directories = resolve_search_directories(cli, config)?;
+    let version_rewrite = resolve_version_rewrite(cli, config)?;
+    let skip_duplicate = cli.skip_duplicate
+        || config
+            .and_then(|config| config.skip_duplicate)
+            .unwrap_or(false);
+    let dry_run = cli.dry_run || config.and_then(|config| config.dry_run).unwrap_or(false);
+
+    Ok(ResolvedOptions {
+        source,
+        api_key,
+        directories,
+        version_rewrite,
+        skip_duplicate,
+        dry_run,
+    })
+}
+
 /// Resolves the set of directories to scan for nupkg files.
-fn resolve_search_directories(cli: &Cli) -> Result<Vec<PathBuf>> {
+fn resolve_search_directories(cli: &Cli, config: Option<&PduploadConfig>) -> Result<Vec<PathBuf>> {
     if !cli.directories.is_empty() {
         let mut resolved = Vec::with_capacity(cli.directories.len());
         for directory in &cli.directories {
+            if !directory.exists() {
+                bail!(
+                    "configured directory does not exist: {}",
+                    directory.display()
+                );
+            }
+            if !directory.is_dir() {
+                bail!(
+                    "configured path is not a directory: {}",
+                    directory.display()
+                );
+            }
+            resolved.push(directory.clone());
+        }
+        return Ok(resolved);
+    }
+
+    if let Some(config_directories) = config.and_then(|config| config.directories.as_ref()) {
+        let mut resolved = Vec::with_capacity(config_directories.len());
+        for directory in config_directories {
             if !directory.exists() {
                 bail!(
                     "configured directory does not exist: {}",
@@ -396,7 +509,10 @@ fn validate_version_arguments(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn version_rewrite_from_cli(cli: &Cli) -> Result<Option<VersionRewrite>> {
+fn resolve_version_rewrite(
+    cli: &Cli,
+    config: Option<&PduploadConfig>,
+) -> Result<Option<VersionRewrite>> {
     if let Some(package_version) = &cli.package_version {
         return Ok(Some(VersionRewrite::Exact(package_version.clone())));
     }
@@ -404,7 +520,27 @@ fn version_rewrite_from_cli(cli: &Cli) -> Result<Option<VersionRewrite>> {
     match &cli.version_suffix {
         Some(Some(suffix)) => Ok(Some(VersionRewrite::Suffix(suffix.clone()))),
         Some(None) => Ok(Some(VersionRewrite::Suffix(default_version_suffix()?))),
-        None => Ok(None),
+        None => resolve_version_rewrite_from_config(config),
+    }
+}
+
+fn resolve_version_rewrite_from_config(
+    config: Option<&PduploadConfig>,
+) -> Result<Option<VersionRewrite>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    match (&config.package_version, &config.version_suffix) {
+        (Some(_), Some(_)) => {
+            bail!("config file cannot set both package_version and version_suffix")
+        }
+        (Some(package_version), None) => Ok(Some(VersionRewrite::Exact(package_version.clone()))),
+        (None, Some(version_suffix)) if version_suffix.trim().is_empty() => {
+            Ok(Some(VersionRewrite::Suffix(default_version_suffix()?)))
+        }
+        (None, Some(version_suffix)) => Ok(Some(VersionRewrite::Suffix(version_suffix.clone()))),
+        (None, None) => Ok(None),
     }
 }
 
@@ -532,12 +668,27 @@ struct RewrittenNuspec {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SUFFIX_TOKEN_WIDTH, PackageIdentity, VersionRewrite, child_text,
+        DEFAULT_SUFFIX_TOKEN_WIDTH, PackageIdentity, PduploadConfig, VersionRewrite, child_text,
         default_suffix_token, default_version_suffix, display_paths, is_uploadable_package,
-        package_file_name, rewrite_nuspec_version, version_prefix,
+        package_file_name, resolve_options, resolve_version_rewrite_from_config,
+        rewrite_nuspec_version, version_prefix,
     };
     use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
     use xmltree::Element;
+
+    fn cli_with_defaults() -> super::Cli {
+        super::Cli {
+            config: None,
+            source: None,
+            api_key: None,
+            directories: Vec::new(),
+            package_version: None,
+            version_suffix: None,
+            skip_duplicate: false,
+            dry_run: false,
+        }
+    }
 
     #[test]
     fn symbols_packages_are_skipped() {
@@ -628,5 +779,85 @@ mod tests {
         let token = default_suffix_token(0x1234_abcd, 0x42);
         assert_eq!(token.len(), DEFAULT_SUFFIX_TOKEN_WIDTH);
         assert!(token.chars().all(|character| character.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn config_can_supply_default_source_and_flags() {
+        let cli = cli_with_defaults();
+        let temp_dir = tempdir().unwrap();
+        let config = PduploadConfig {
+            source: Some("MyFeed".to_string()),
+            api_key: Some("secret".to_string()),
+            directories: Some(vec![temp_dir.path().to_path_buf()]),
+            package_version: None,
+            version_suffix: Some("ci.4".to_string()),
+            skip_duplicate: Some(true),
+            dry_run: Some(true),
+        };
+
+        let resolved = resolve_options(&cli, Some(&config)).unwrap();
+
+        assert_eq!(resolved.source, "MyFeed");
+        assert_eq!(resolved.api_key.as_deref(), Some("secret"));
+        assert_eq!(
+            resolved.version_rewrite,
+            Some(VersionRewrite::Suffix("ci.4".to_string()))
+        );
+        assert!(resolved.skip_duplicate);
+        assert!(resolved.dry_run);
+    }
+
+    #[test]
+    fn cli_overrides_config_values() {
+        let temp_dir = tempdir().unwrap();
+        let cli = super::Cli {
+            source: Some("CliFeed".to_string()),
+            api_key: Some("cli-key".to_string()),
+            directories: vec![temp_dir.path().to_path_buf()],
+            package_version: Some("2.0.0".to_string()),
+            skip_duplicate: true,
+            dry_run: true,
+            ..cli_with_defaults()
+        };
+        let config = PduploadConfig {
+            source: Some("ConfigFeed".to_string()),
+            api_key: Some("config-key".to_string()),
+            directories: None,
+            package_version: Some("1.0.0".to_string()),
+            version_suffix: None,
+            skip_duplicate: Some(false),
+            dry_run: Some(false),
+        };
+
+        let resolved = resolve_options(&cli, Some(&config)).unwrap();
+
+        assert_eq!(resolved.source, "CliFeed");
+        assert_eq!(resolved.api_key.as_deref(), Some("cli-key"));
+        assert_eq!(
+            resolved.version_rewrite,
+            Some(VersionRewrite::Exact("2.0.0".to_string()))
+        );
+        assert!(resolved.skip_duplicate);
+        assert!(resolved.dry_run);
+    }
+
+    #[test]
+    fn config_rejects_conflicting_version_fields() {
+        let config = PduploadConfig {
+            source: None,
+            api_key: None,
+            directories: None,
+            package_version: Some("1.0.0".to_string()),
+            version_suffix: Some("ci.1".to_string()),
+            skip_duplicate: None,
+            dry_run: None,
+        };
+
+        let error = resolve_version_rewrite_from_config(Some(&config)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot set both package_version and version_suffix")
+        );
     }
 }
