@@ -54,4 +54,4 @@ The version model is repo-native rather than semver-heavy:
 - installs record the exact commit hash and commit date
 - `toolctl` can rebuild an older version by checking out that commit in a temporary worktree
 
-That is a better fit for a personal tools repo where the source of truth is this repository history.
+That is a better fit for a personal tools repo where the source of truth is this repository history. 
