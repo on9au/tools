@@ -75,6 +75,18 @@ Install the latest version of a tool:
 cargo run -p toolctl -- install some-tool
 ```
 
+Install multiple tools in one command:
+
+```powershell
+cargo run -p toolctl -- install some-tool another-tool
+```
+
+Install every available tool:
+
+```powershell
+cargo run -p toolctl -- install all
+```
+
 Install a specific commit:
 
 ```powershell

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -77,6 +78,15 @@ struct PackageUpload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct PushResult {
+    upload: PackageUpload,
+    succeeded: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PackageIdentity {
     package_id: String,
     version: String,
@@ -150,9 +160,9 @@ fn try_main() -> Result<()> {
         resolved.rewrite_workspace_dependency_versions,
         temp_dir.as_ref(),
     )?;
-    print_upload_plan(&uploads, &resolved.source);
 
     if resolved.dry_run {
+        print_upload_summary(&uploads, &resolved.source, None, true);
         return Ok(());
     }
 
@@ -160,8 +170,24 @@ fn try_main() -> Result<()> {
         anyhow!("missing API key; pass --api-key or set the packagingFeedKey environment variable")
     })?;
 
+    let mut push_results = Vec::with_capacity(uploads.len());
     for upload in &uploads {
-        push_package(upload, &resolved.source, api_key, resolved.skip_duplicate)?;
+        push_results.push(push_package(
+            upload,
+            &resolved.source,
+            api_key,
+            resolved.skip_duplicate,
+        )?);
+    }
+
+    print_upload_summary(&uploads, &resolved.source, Some(&push_results), false);
+
+    let failed_uploads = push_results
+        .iter()
+        .filter(|result| !result.succeeded)
+        .count();
+    if failed_uploads > 0 {
+        bail!("dotnet nuget push failed for {failed_uploads} package(s)");
     }
 
     Ok(())
@@ -510,7 +536,7 @@ fn push_package(
     source: &str,
     api_key: &str,
     skip_duplicate: bool,
-) -> Result<()> {
+) -> Result<PushResult> {
     let mut command = Command::new("dotnet");
     command
         .arg("nuget")
@@ -525,21 +551,20 @@ fn push_package(
         command.arg("--skip-duplicate");
     }
 
-    let status = command.status().with_context(|| {
+    let output = command.output().with_context(|| {
         format!(
             "failed to invoke dotnet nuget push for {}",
             upload.upload_path.display()
         )
     })?;
 
-    if !status.success() {
-        bail!(
-            "dotnet nuget push failed for {}",
-            upload.upload_path.display()
-        )
-    }
-
-    Ok(())
+    Ok(PushResult {
+        upload: upload.clone(),
+        succeeded: output.status.success(),
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 /// Rewrites the package version inside a nuspec XML document.
@@ -801,20 +826,111 @@ fn default_suffix_token(unix_timestamp_nanos: i128, process_id: u32) -> String {
     format!("{lower_bits:0width$x}", width = DEFAULT_SUFFIX_TOKEN_WIDTH)
 }
 
-/// Prints the final set of packages that will be uploaded.
-fn print_upload_plan(uploads: &[PackageUpload], source: &str) {
-    println!("source: {source}");
-    for upload in uploads {
-        match (&upload.package_id, &upload.package_version) {
-            (Some(package_id), Some(package_version)) => println!(
-                "upload {} as {} {}",
-                upload.source_path.display(),
-                package_id,
-                package_version
-            ),
-            _ => println!("upload {}", upload.upload_path.display()),
-        }
+fn print_upload_summary(
+    uploads: &[PackageUpload],
+    source: &str,
+    push_results: Option<&[PushResult]>,
+    dry_run: bool,
+) {
+    print!(
+        "{}",
+        render_upload_summary(uploads, source, push_results, dry_run)
+    );
+}
+
+fn render_upload_summary(
+    uploads: &[PackageUpload],
+    source: &str,
+    push_results: Option<&[PushResult]>,
+    dry_run: bool,
+) -> String {
+    let mut summary = String::new();
+    let total_uploads = uploads.len();
+    let failed_uploads = push_results
+        .map(|results| results.iter().filter(|result| !result.succeeded).count())
+        .unwrap_or(0);
+    let succeeded_uploads = push_results
+        .map(|results| results.iter().filter(|result| result.succeeded).count())
+        .unwrap_or(0);
+
+    let _ = writeln!(summary, "Upload Summary");
+    let _ = writeln!(summary, "==============");
+    let _ = writeln!(summary, "Source: {source}");
+    let _ = writeln!(
+        summary,
+        "Mode: {}",
+        if dry_run { "dry run" } else { "push" }
+    );
+    let _ = writeln!(summary, "Packages: {total_uploads}");
+    if let Some(_) = push_results {
+        let _ = writeln!(summary, "Succeeded: {succeeded_uploads}");
+        let _ = writeln!(summary, "Failed: {failed_uploads}");
     }
+    let _ = writeln!(summary);
+
+    for (index, upload) in uploads.iter().enumerate() {
+        let push_result = push_results.and_then(|results| results.get(index));
+        let status_label = match push_result {
+            Some(result) if result.succeeded => "OK",
+            Some(_) => "FAILED",
+            None => "PLANNED",
+        };
+        let _ = writeln!(
+            summary,
+            "[{}/{}] {} {}",
+            index + 1,
+            total_uploads,
+            status_label,
+            display_upload_identity(upload)
+        );
+        let _ = writeln!(summary, "  source: {}", upload.source_path.display());
+        let _ = writeln!(summary, "  upload: {}", upload.upload_path.display());
+
+        if let Some(result) = push_result {
+            let exit_code = result
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "terminated by signal".to_string());
+            let _ = writeln!(summary, "  exit code: {exit_code}");
+            append_log_block(&mut summary, "stdout", &result.stdout);
+            append_log_block(&mut summary, "stderr", &result.stderr);
+        }
+
+        let _ = writeln!(summary);
+    }
+
+    summary
+}
+
+fn display_upload_identity(upload: &PackageUpload) -> String {
+    match (&upload.package_id, &upload.package_version) {
+        (Some(package_id), Some(package_version)) => format!("{package_id} {package_version}"),
+        _ => match upload.upload_path.file_name().and_then(OsStr::to_str) {
+            Some(file_name) => file_name.to_string(),
+            None => upload.upload_path.to_string_lossy().into_owned(),
+        },
+    }
+}
+
+fn append_log_block(summary: &mut String, label: &str, output: &str) {
+    let _ = writeln!(summary, "  {label}:");
+    let lines = normalized_log_lines(output);
+    if lines.is_empty() {
+        let _ = writeln!(summary, "    (none)");
+        return;
+    }
+
+    for line in lines {
+        let _ = writeln!(summary, "    {line}");
+    }
+}
+
+fn normalized_log_lines(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect()
 }
 
 fn child_element_mut<'a>(element: &'a mut Element, name: &str) -> Result<Option<&'a mut Element>> {
@@ -885,11 +1001,11 @@ struct RewrittenNuspec {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SUFFIX_TOKEN_WIDTH, PackageIdentity, PduploadConfig, VersionRewrite,
-        candidate_config_paths, child_text, default_suffix_token, default_version_suffix,
-        display_paths, global_config_path, is_uploadable_package, package_file_name,
-        resolve_options, resolve_version_rewrite_from_config, rewrite_nuspec_version,
-        version_prefix,
+        DEFAULT_SUFFIX_TOKEN_WIDTH, PackageIdentity, PackageUpload, PduploadConfig, PushResult,
+        VersionRewrite, candidate_config_paths, child_text, default_suffix_token,
+        default_version_suffix, display_paths, global_config_path, is_uploadable_package,
+        package_file_name, render_upload_summary, resolve_options,
+        resolve_version_rewrite_from_config, rewrite_nuspec_version, version_prefix,
     };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -1040,6 +1156,48 @@ mod tests {
     fn display_paths_joins_multiple_paths() {
         let display = display_paths(&[PathBuf::from("bin/nuget"), PathBuf::from("package")]);
         assert_eq!(display, "bin/nuget, package");
+    }
+
+    #[test]
+    fn rendered_upload_summary_includes_push_logs() {
+        let upload = PackageUpload {
+            source_path: PathBuf::from("bin/nuget/A.1.0.0.nupkg"),
+            upload_path: PathBuf::from("temp/A.2.0.0.nupkg"),
+            package_id: Some("A".to_string()),
+            package_version: Some("2.0.0".to_string()),
+        };
+        let push_result = PushResult {
+            upload: upload.clone(),
+            succeeded: true,
+            exit_code: Some(0),
+            stdout: "Pushing A.2.0.0.nupkg\n  to feed\n".to_string(),
+            stderr: String::new(),
+        };
+
+        let summary = render_upload_summary(&[upload], "MyFeed", Some(&[push_result]), false);
+
+        assert!(summary.contains("Upload Summary"));
+        assert!(summary.contains("[1/1] OK A 2.0.0"));
+        assert!(summary.contains("Succeeded: 1"));
+        assert!(summary.contains("stdout:"));
+        assert!(summary.contains("Pushing A.2.0.0.nupkg"));
+        assert!(summary.contains("stderr:\n    (none)"));
+    }
+
+    #[test]
+    fn rendered_dry_run_summary_marks_uploads_as_planned() {
+        let upload = PackageUpload {
+            source_path: PathBuf::from("bin/nuget/B.1.0.0.nupkg"),
+            upload_path: PathBuf::from("bin/nuget/B.1.0.0.nupkg"),
+            package_id: Some("B".to_string()),
+            package_version: Some("1.0.0".to_string()),
+        };
+
+        let summary = render_upload_summary(&[upload], "MyFeed", None, true);
+
+        assert!(summary.contains("Mode: dry run"));
+        assert!(summary.contains("[1/1] PLANNED B 1.0.0"));
+        assert!(!summary.contains("stdout:"));
     }
 
     #[test]

@@ -1,11 +1,13 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table, presets::UTF8_FULL};
+use dialoguer::{MultiSelect, Select, theme::ColorfulTheme};
 use serde::Deserialize;
 use tool_core::{
     InstallLayout, InstalledToolRecord, display_name, install_binary_file, with_exe_suffix,
@@ -68,8 +70,8 @@ struct VersionsArgs {
 
 #[derive(Debug, Args)]
 struct InstallArgs {
-    /// The tool name to install. If omitted, toolctl prompts with the available list.
-    tool_name: Option<String>,
+    /// One or more tool names to install. Use `all` to install every available tool.
+    tool_names: Vec<String>,
     /// The commit-ish to build. Defaults to the latest commit affecting the tool.
     #[arg(long)]
     version: Option<String>,
@@ -180,21 +182,24 @@ impl ToolctlContext {
     fn list_installed_tools(&self) -> Result<ExitCode> {
         let records = self.layout.installed_records()?;
         if records.is_empty() {
+            print_section_title("Installed Tools");
             for binary in self.layout.managed_binaries()? {
                 println!("{}", display_name(&binary)?);
             }
             return Ok(ExitCode::SUCCESS);
         }
 
+        print_section_title("Installed Tools");
+        let mut table = new_table(["Tool", "Commit", "Date", "Package"]);
         for record in records {
-            println!(
-                "{}\t{}\t{}\t{}",
+            table.add_row(vec![
                 record.tool_name,
-                short_commit(&record.commit),
+                short_commit(&record.commit).to_string(),
                 record.commit_date,
-                record.package_name
-            );
+                record.package_name,
+            ]);
         }
+        println!("{table}");
 
         Ok(ExitCode::SUCCESS)
     }
@@ -202,15 +207,17 @@ impl ToolctlContext {
     /// Prints all installable tools discovered from the repo catalog.
     fn list_available_tools(&self) -> Result<ExitCode> {
         let catalog = repo_catalog(&self.layout)?;
+        print_section_title("Available Tools");
+        let mut table = new_table(["Tool", "Latest", "Date", "Package"]);
         for tool in catalog {
-            println!(
-                "{}\t{}\t{}\t{}",
+            table.add_row(vec![
                 tool.binary_name,
-                short_commit(&tool.latest_version.commit),
+                short_commit(&tool.latest_version.commit).to_string(),
                 tool.latest_version.commit_date,
-                tool.package_name
-            );
+                tool.package_name,
+            ]);
         }
+        println!("{table}");
 
         Ok(ExitCode::SUCCESS)
     }
@@ -220,15 +227,45 @@ impl ToolctlContext {
         let binaries = self.layout.managed_binaries()?;
         let records = self.layout.installed_records()?;
 
-        println!("home: {}", self.layout.home_dir().display());
-        println!("bin: {}", self.layout.bin_dir().display());
-        println!("metadata: {}", self.layout.metadata_dir().display());
-        println!("repo cache: {}", self.layout.repo_dir().display());
-        println!("worktrees: {}", self.layout.worktrees_dir().display());
-        println!("managed binaries: {}", binaries.len());
-        println!("installed metadata records: {}", records.len());
-        println!("bin directory exists: {}", self.layout.bin_dir().exists());
-        println!("repo cache exists: {}", self.layout.repo_dir().exists());
+        print_section_title("Toolctl Doctor");
+        let mut table = new_table(["Check", "Value"]);
+        table.add_row(vec![
+            "home".to_string(),
+            self.layout.home_dir().display().to_string(),
+        ]);
+        table.add_row(vec![
+            "bin".to_string(),
+            self.layout.bin_dir().display().to_string(),
+        ]);
+        table.add_row(vec![
+            "metadata".to_string(),
+            self.layout.metadata_dir().display().to_string(),
+        ]);
+        table.add_row(vec![
+            "repo cache".to_string(),
+            self.layout.repo_dir().display().to_string(),
+        ]);
+        table.add_row(vec![
+            "worktrees".to_string(),
+            self.layout.worktrees_dir().display().to_string(),
+        ]);
+        table.add_row(vec![
+            "managed binaries".to_string(),
+            binaries.len().to_string(),
+        ]);
+        table.add_row(vec![
+            "installed metadata records".to_string(),
+            records.len().to_string(),
+        ]);
+        table.add_row(vec![
+            "bin directory exists".to_string(),
+            self.layout.bin_dir().exists().to_string(),
+        ]);
+        table.add_row(vec![
+            "repo cache exists".to_string(),
+            self.layout.repo_dir().exists().to_string(),
+        ]);
+        println!("{table}");
 
         Ok(ExitCode::SUCCESS)
     }
@@ -236,7 +273,8 @@ impl ToolctlContext {
     /// Syncs the source tools repository and prints its local path.
     fn sync_and_report(&self) -> Result<ExitCode> {
         self.sync_repo()?;
-        println!("synced {}", self.layout.repo_dir().display());
+        print_section_title("Repository Sync");
+        println!("Synced {}", self.layout.repo_dir().display());
         Ok(ExitCode::SUCCESS)
     }
 
@@ -245,45 +283,68 @@ impl ToolctlContext {
         self.sync_repo()?;
 
         let tool = find_tool(&self.layout, &versions_args.tool_name)?;
+        print_section_title(&format!("Versions for {}", tool.binary_name));
+        let mut table = new_table(["Commit", "Date", "Summary"]);
         for version in tool_versions(
             self.layout.repo_dir(),
             &tool.package_dir,
             versions_args.limit,
         )? {
-            println!(
-                "{}\t{}\t{}",
-                version.commit, version.commit_date, version.summary
-            );
+            table.add_row(vec![version.commit, version.commit_date, version.summary]);
         }
+        println!("{table}");
 
         Ok(ExitCode::SUCCESS)
     }
 
-    /// Builds and installs one tool from the source repo.
+    /// Builds and installs one or more tools from the source repo.
     fn install_tool(&self, install_args: InstallArgs) -> Result<ExitCode> {
         self.prepare_repo_cache(install_args.no_sync)?;
 
         let catalog = repo_catalog(&self.layout)?;
-        let tool = select_install_tool(&catalog, install_args.tool_name.as_deref())?;
-        let version = select_install_version(&self.layout, &tool, &install_args)?;
+        let tools = select_install_tools(&catalog, &install_args.tool_names)?;
+        if tools.len() > 1 && install_args.select_version {
+            bail!("--select-version can only be used when installing exactly one tool")
+        }
 
-        let destination = build_and_install(&self.layout, &tool, &version, install_args.copy)?;
-        let record = InstalledToolRecord {
-            tool_name: tool.binary_name.clone(),
-            package_name: tool.package_name.clone(),
-            commit: version.commit.clone(),
-            commit_date: version.commit_date.clone(),
-            installed_at: iso_like_timestamp()?,
-            repository_url: REPOSITORY_URL.to_string(),
-        };
-        self.layout.write_installed_record(&record)?;
+        print_section_title("Install Plan");
+        let mut plan_table = new_table(["Tool", "Target Version", "Package"]);
+        let mut install_rows = Vec::new();
 
-        println!(
-            "installed {} at {} ({})",
-            record.tool_name,
-            short_commit(&record.commit),
-            destination.display()
-        );
+        for tool in tools {
+            let version = select_install_version(&self.layout, &tool, &install_args)?;
+            plan_table.add_row(vec![
+                tool.binary_name.clone(),
+                format!("{} {}", short_commit(&version.commit), version.commit_date),
+                tool.package_name.clone(),
+            ]);
+            install_rows.push((tool, version));
+        }
+
+        println!("{plan_table}");
+
+        let mut summary_table = new_table(["Tool", "Installed", "Package", "Path"]);
+        for (tool, version) in install_rows {
+            let destination = build_and_install(&self.layout, &tool, &version, install_args.copy)?;
+            let record = InstalledToolRecord {
+                tool_name: tool.binary_name.clone(),
+                package_name: tool.package_name.clone(),
+                commit: version.commit.clone(),
+                commit_date: version.commit_date.clone(),
+                installed_at: iso_like_timestamp()?,
+                repository_url: REPOSITORY_URL.to_string(),
+            };
+            self.layout.write_installed_record(&record)?;
+            summary_table.add_row(vec![
+                record.tool_name,
+                short_commit(&record.commit).to_string(),
+                record.package_name,
+                destination.display().to_string(),
+            ]);
+        }
+
+        print_section_title("Installed Tools");
+        println!("{summary_table}");
 
         Ok(ExitCode::SUCCESS)
     }
@@ -321,11 +382,29 @@ impl ToolctlContext {
     }
 }
 
-fn select_install_tool(catalog: &[RepoTool], tool_name: Option<&str>) -> Result<RepoTool> {
-    match tool_name {
-        Some(tool_name) => select_named_tool(catalog, tool_name),
-        None => select_tool_prompt(catalog),
+fn select_install_tools(catalog: &[RepoTool], tool_names: &[String]) -> Result<Vec<RepoTool>> {
+    if catalog.is_empty() {
+        bail!("no installable tools were found in the repository catalog")
     }
+
+    if tool_names.is_empty() {
+        return select_tools_prompt(catalog);
+    }
+
+    if tool_names.iter().any(|tool_name| is_all_target(tool_name)) {
+        return Ok(catalog.to_vec());
+    }
+
+    let mut seen = HashSet::new();
+    let mut selected = Vec::new();
+    for tool_name in tool_names {
+        if !seen.insert(tool_name.to_ascii_lowercase()) {
+            continue;
+        }
+        selected.push(select_named_tool(catalog, tool_name)?);
+    }
+
+    Ok(selected)
 }
 
 fn select_install_version(
@@ -461,32 +540,39 @@ fn find_tool(layout: &InstallLayout, tool_name: &str) -> Result<RepoTool> {
 }
 
 fn select_named_tool(catalog: &[RepoTool], tool_name: &str) -> Result<RepoTool> {
+    if is_all_target(tool_name) {
+        bail!("`all` selects multiple tools and is only valid with `toolctl install`")
+    }
+
     catalog
         .iter()
-        .find(|tool| tool.binary_name == tool_name)
+        .find(|tool| tool.binary_name.eq_ignore_ascii_case(tool_name))
         .cloned()
         .ok_or_else(|| anyhow!("unknown tool '{tool_name}'"))
 }
 
-fn select_tool_prompt(catalog: &[RepoTool]) -> Result<RepoTool> {
-    if catalog.is_empty() {
-        bail!("no installable tools were found in the repository catalog")
+fn select_tools_prompt(catalog: &[RepoTool]) -> Result<Vec<RepoTool>> {
+    let mut options = vec![format!("all tools [{} available]", catalog.len())];
+    options.extend(catalog.iter().map(format_tool_option));
+
+    let selections = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select tool(s) to install")
+        .items(&options)
+        .interact()
+        .context("failed to read tool selections")?;
+
+    if selections.is_empty() {
+        bail!("no tools were selected")
     }
 
-    let options = catalog
-        .iter()
-        .map(|tool| {
-            format!(
-                "{} [{} {}]",
-                tool.binary_name,
-                short_commit(&tool.latest_version.commit),
-                tool.latest_version.commit_date
-            )
-        })
-        .collect::<Vec<_>>();
+    if selections.contains(&0) {
+        return Ok(catalog.to_vec());
+    }
 
-    let index = prompt_for_index("Select a tool to install", &options)?;
-    Ok(catalog[index].clone())
+    Ok(selections
+        .into_iter()
+        .map(|index| catalog[index - 1].clone())
+        .collect())
 }
 
 fn select_version_prompt(repo_dir: &Path, tool: &RepoTool) -> Result<ToolVersion> {
@@ -497,44 +583,56 @@ fn select_version_prompt(repo_dir: &Path, tool: &RepoTool) -> Result<ToolVersion
 
     let options = versions
         .iter()
-        .map(|version| {
-            format!(
-                "{} {} {}",
-                short_commit(&version.commit),
-                version.commit_date,
-                version.summary
-            )
-        })
+        .map(format_version_option)
         .collect::<Vec<_>>();
 
-    let index = prompt_for_index("Select a version", &options)?;
+    let index = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select a version")
+        .items(&options)
+        .default(0)
+        .interact()
+        .context("failed to read version selection")?;
     Ok(versions[index].clone())
 }
 
-fn prompt_for_index(prompt: &str, options: &[String]) -> Result<usize> {
-    println!("{prompt}:");
-    for (index, option) in options.iter().enumerate() {
-        println!("  {}. {}", index + 1, option);
-    }
+fn format_tool_option(tool: &RepoTool) -> String {
+    format!(
+        "{}  {}  {}  {}",
+        tool.binary_name,
+        short_commit(&tool.latest_version.commit),
+        tool.latest_version.commit_date,
+        tool.package_name
+    )
+}
 
-    print!("> ");
-    io::stdout().flush().context("failed to flush stdout")?;
+fn format_version_option(version: &ToolVersion) -> String {
+    format!(
+        "{}  {}  {}",
+        short_commit(&version.commit),
+        version.commit_date,
+        version.summary
+    )
+}
 
-    let mut buffer = String::new();
-    io::stdin()
-        .read_line(&mut buffer)
-        .context("failed to read selection")?;
+fn is_all_target(tool_name: &str) -> bool {
+    tool_name.eq_ignore_ascii_case("all")
+}
 
-    let selection = buffer
-        .trim()
-        .parse::<usize>()
-        .context("selection must be a number")?;
+fn print_section_title(title: &str) {
+    println!("\n== {title} ==");
+}
 
-    if selection == 0 || selection > options.len() {
-        bail!("selection must be between 1 and {}", options.len())
-    }
-
-    Ok(selection - 1)
+fn new_table<const N: usize>(headers: [&str; N]) -> Table {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(headers.into_iter().map(|header| {
+            Cell::new(header)
+                .fg(Color::Cyan)
+                .add_attribute(Attribute::Bold)
+        }));
+    table
 }
 
 fn tool_versions(repo_dir: &Path, package_dir: &Path, limit: usize) -> Result<Vec<ToolVersion>> {
@@ -774,8 +872,9 @@ fn iso_like_timestamp() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_VERSION_LIMIT, built_binary_path, ensure_built_binary_exists, parse_version_line,
-        sanitize_name, short_commit,
+        DEFAULT_VERSION_LIMIT, RepoTool, ToolVersion, built_binary_path,
+        ensure_built_binary_exists, format_tool_option, format_version_option, is_all_target,
+        parse_version_line, sanitize_name, short_commit,
     };
     use std::env;
     use std::fs;
@@ -822,6 +921,46 @@ mod tests {
     #[test]
     fn default_version_limit_is_positive() {
         assert!(DEFAULT_VERSION_LIMIT > 0);
+    }
+
+    #[test]
+    fn all_target_is_case_insensitive() {
+        assert!(is_all_target("all"));
+        assert!(is_all_target("ALL"));
+        assert!(!is_all_target("pdupload"));
+    }
+
+    #[test]
+    fn format_tool_option_includes_tool_metadata() {
+        let option = format_tool_option(&RepoTool {
+            package_name: "crates/tool/example".to_string(),
+            binary_name: "example".to_string(),
+            manifest_path: Path::new("C:/tmp/Cargo.toml").to_path_buf(),
+            package_dir: Path::new("C:/tmp").to_path_buf(),
+            latest_version: ToolVersion {
+                commit: "1234567890abcdef".to_string(),
+                commit_date: "2026-04-29".to_string(),
+                summary: "Add example".to_string(),
+            },
+        });
+
+        assert!(option.contains("example"));
+        assert!(option.contains("12345678"));
+        assert!(option.contains("2026-04-29"));
+        assert!(option.contains("crates/tool/example"));
+    }
+
+    #[test]
+    fn format_version_option_includes_summary() {
+        let option = format_version_option(&ToolVersion {
+            commit: "1234567890abcdef".to_string(),
+            commit_date: "2026-04-29".to_string(),
+            summary: "Ship install flow".to_string(),
+        });
+
+        assert!(option.contains("12345678"));
+        assert!(option.contains("2026-04-29"));
+        assert!(option.contains("Ship install flow"));
     }
 
     fn unique_temp_path(prefix: &str) -> std::path::PathBuf {
