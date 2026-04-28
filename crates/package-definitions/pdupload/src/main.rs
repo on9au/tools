@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -56,6 +57,9 @@ struct Cli {
     /// Override the prefix version used when composing a suffix-based package version.
     #[arg(long)]
     prefix_version: Option<String>,
+    /// Keep detected workspace package dependency versions unchanged when rewriting package versions.
+    #[arg(long)]
+    no_rewrite_workspace_dependency_versions: bool,
     /// Skip duplicate packages when the feed already contains the package.
     #[arg(long)]
     skip_duplicate: bool,
@@ -95,6 +99,7 @@ struct PduploadConfig {
     package_version: Option<String>,
     version_suffix: Option<String>,
     prefix_version: Option<String>,
+    rewrite_workspace_dependency_versions: Option<bool>,
     skip_duplicate: Option<bool>,
     dry_run: Option<bool>,
 }
@@ -105,6 +110,7 @@ struct ResolvedOptions {
     api_key: Option<String>,
     directories: Vec<PathBuf>,
     version_rewrite: Option<VersionRewrite>,
+    rewrite_workspace_dependency_versions: bool,
     skip_duplicate: bool,
     dry_run: bool,
 }
@@ -141,6 +147,7 @@ fn try_main() -> Result<()> {
     let uploads = prepare_uploads(
         &package_paths,
         resolved.version_rewrite.as_ref(),
+        resolved.rewrite_workspace_dependency_versions,
         temp_dir.as_ref(),
     )?;
     print_upload_plan(&uploads, &resolved.source);
@@ -245,6 +252,13 @@ fn resolve_options(cli: &Cli, config: Option<&PduploadConfig>) -> Result<Resolve
 
     let directories = resolve_search_directories(cli, config)?;
     let version_rewrite = resolve_version_rewrite(cli, config)?;
+    let rewrite_workspace_dependency_versions = if cli.no_rewrite_workspace_dependency_versions {
+        false
+    } else {
+        config
+            .and_then(|config| config.rewrite_workspace_dependency_versions)
+            .unwrap_or(true)
+    };
     let skip_duplicate = cli.skip_duplicate
         || config
             .and_then(|config| config.skip_duplicate)
@@ -256,6 +270,7 @@ fn resolve_options(cli: &Cli, config: Option<&PduploadConfig>) -> Result<Resolve
         api_key,
         directories,
         version_rewrite,
+        rewrite_workspace_dependency_versions,
         skip_duplicate,
         dry_run,
     })
@@ -349,14 +364,26 @@ fn discover_package_paths(directories: &[PathBuf]) -> Result<Vec<PathBuf>> {
 fn prepare_uploads(
     package_paths: &[PathBuf],
     version_rewrite: Option<&VersionRewrite>,
+    rewrite_workspace_dependency_versions: bool,
     temp_dir: Option<&TempDir>,
 ) -> Result<Vec<PackageUpload>> {
+    let workspace_dependency_versions = if rewrite_workspace_dependency_versions {
+        version_rewrite
+            .map(|version_rewrite| {
+                collect_workspace_dependency_versions(package_paths, version_rewrite)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+
     package_paths
         .iter()
         .map(|package_path| match version_rewrite {
             Some(version_rewrite) => repack_package_with_version(
                 package_path,
                 version_rewrite,
+                workspace_dependency_versions.as_ref(),
                 temp_dir
                     .expect("temp directory must exist when version rewriting is enabled")
                     .path(),
@@ -375,6 +402,7 @@ fn prepare_uploads(
 fn repack_package_with_version(
     package_path: &Path,
     version_rewrite: &VersionRewrite,
+    workspace_dependency_versions: Option<&HashMap<String, String>>,
     output_directory: &Path,
 ) -> Result<PackageUpload> {
     let source_file = File::open(package_path)
@@ -425,7 +453,8 @@ fn repack_package_with_version(
             .with_context(|| format!("failed to add {entry_name} to repacked package"))?;
 
         if entry_name.ends_with(".nuspec") {
-            let updated_nuspec = rewrite_nuspec_version(&bytes, version_rewrite)?;
+            let updated_nuspec =
+                rewrite_nuspec_version(&bytes, version_rewrite, workspace_dependency_versions)?;
             package_identity = Some(updated_nuspec.identity.clone());
             writer
                 .write_all(&updated_nuspec.contents)
@@ -517,6 +546,7 @@ fn push_package(
 fn rewrite_nuspec_version(
     nuspec_bytes: &[u8],
     version_rewrite: &VersionRewrite,
+    workspace_dependency_versions: Option<&HashMap<String, String>>,
 ) -> Result<RewrittenNuspec> {
     let mut root = Element::parse(Cursor::new(nuspec_bytes))
         .context("failed to parse nuspec XML while rewriting package version")?;
@@ -529,6 +559,9 @@ fn rewrite_nuspec_version(
         .ok_or_else(|| anyhow!("nuspec metadata does not contain a version element"))?;
     let package_version = resolve_package_version(&current_version, version_rewrite)?;
     set_child_text(metadata, "version", &package_version)?;
+    if let Some(workspace_dependency_versions) = workspace_dependency_versions {
+        rewrite_dependency_versions(metadata, workspace_dependency_versions);
+    }
 
     let mut contents = Vec::new();
     root.write_with_config(
@@ -546,6 +579,103 @@ fn rewrite_nuspec_version(
         },
         contents,
     })
+}
+
+fn collect_workspace_dependency_versions(
+    package_paths: &[PathBuf],
+    version_rewrite: &VersionRewrite,
+) -> Result<HashMap<String, String>> {
+    let mut workspace_dependency_versions = HashMap::with_capacity(package_paths.len());
+
+    for package_path in package_paths {
+        let identity = read_package_identity_with_rewritten_version(package_path, version_rewrite)?;
+        workspace_dependency_versions.insert(identity.package_id, identity.version);
+    }
+
+    Ok(workspace_dependency_versions)
+}
+
+fn read_package_identity_with_rewritten_version(
+    package_path: &Path,
+    version_rewrite: &VersionRewrite,
+) -> Result<PackageIdentity> {
+    let source_file = File::open(package_path)
+        .with_context(|| format!("failed to open {}", package_path.display()))?;
+    let mut archive = ZipArchive::new(source_file).with_context(|| {
+        format!(
+            "failed to read {} as a nupkg archive",
+            package_path.display()
+        )
+    })?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).with_context(|| {
+            format!(
+                "failed to read zip entry {index} from {}",
+                package_path.display()
+            )
+        })?;
+
+        if entry.is_dir() || !entry.name().ends_with(".nuspec") {
+            continue;
+        }
+
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).with_context(|| {
+            format!(
+                "failed to read {} from {}",
+                entry.name(),
+                package_path.display()
+            )
+        })?;
+
+        return rewritten_package_identity(&bytes, version_rewrite);
+    }
+
+    Err(anyhow!(
+        "package {} does not contain a .nuspec file",
+        package_path.display()
+    ))
+}
+
+fn rewritten_package_identity(
+    nuspec_bytes: &[u8],
+    version_rewrite: &VersionRewrite,
+) -> Result<PackageIdentity> {
+    let mut root = Element::parse(Cursor::new(nuspec_bytes))
+        .context("failed to parse nuspec XML while reading package identity")?;
+    let metadata = child_element_mut(&mut root, "metadata")?
+        .ok_or_else(|| anyhow!("nuspec does not contain a metadata element"))?;
+
+    let package_id = child_text(metadata, "id")?
+        .ok_or_else(|| anyhow!("nuspec metadata does not contain an id element"))?;
+    let current_version = child_text(metadata, "version")?
+        .ok_or_else(|| anyhow!("nuspec metadata does not contain a version element"))?;
+
+    Ok(PackageIdentity {
+        package_id,
+        version: resolve_package_version(&current_version, version_rewrite)?,
+    })
+}
+
+fn rewrite_dependency_versions(
+    element: &mut Element,
+    workspace_dependency_versions: &HashMap<String, String>,
+) {
+    if element.name == "dependency"
+        && let Some(dependency_id) = element.attributes.get("id")
+        && let Some(rewritten_version) = workspace_dependency_versions.get(dependency_id)
+    {
+        element
+            .attributes
+            .insert("version".to_string(), rewritten_version.clone());
+    }
+
+    for child in &mut element.children {
+        if let XMLNode::Element(child_element) = child {
+            rewrite_dependency_versions(child_element, workspace_dependency_versions);
+        }
+    }
 }
 
 fn validate_version_arguments(cli: &Cli) -> Result<()> {
@@ -761,6 +891,7 @@ mod tests {
         resolve_options, resolve_version_rewrite_from_config, rewrite_nuspec_version,
         version_prefix,
     };
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
     use xmltree::Element;
@@ -774,6 +905,7 @@ mod tests {
             package_version: None,
             version_suffix: None,
             prefix_version: None,
+            no_rewrite_workspace_dependency_versions: false,
             skip_duplicate: false,
             dry_run: false,
         }
@@ -798,6 +930,7 @@ mod tests {
         let rewritten = rewrite_nuspec_version(
             nuspec.as_bytes(),
             &VersionRewrite::Exact("2.5.0".to_string()),
+            None,
         )
         .unwrap();
         let root = Element::parse(rewritten.contents.as_slice()).unwrap();
@@ -827,6 +960,7 @@ mod tests {
                 prefix_version: None,
                 suffix: "pre.20260427".to_string(),
             },
+            None,
         )
         .unwrap();
 
@@ -849,10 +983,47 @@ mod tests {
                 prefix_version: Some("2.1.0".to_string()),
                 suffix: "pre.20260427".to_string(),
             },
+            None,
         )
         .unwrap();
 
         assert_eq!(rewritten.identity.version, "2.1.0-pre.20260427");
+    }
+
+    #[test]
+    fn rewritten_nuspec_updates_detected_workspace_dependency_versions() {
+        let nuspec = r#"<?xml version="1.0"?>
+<package>
+    <metadata>
+        <id>Example.Package</id>
+        <version>1.0.0</version>
+        <dependencies>
+            <group targetFramework="net8.0">
+                <dependency id="B" version="[1.0.0]" />
+                <dependency id="C" version="2.0.0" />
+                <dependency id="External" version="9.9.9" />
+            </group>
+        </dependencies>
+    </metadata>
+</package>"#;
+
+        let rewritten = rewrite_nuspec_version(
+            nuspec.as_bytes(),
+            &VersionRewrite::Exact("2.5.0".to_string()),
+            Some(&HashMap::from([
+                ("B".to_string(), "2.5.0".to_string()),
+                ("C".to_string(), "3.1.0".to_string()),
+            ])),
+        )
+        .unwrap();
+        let root = Element::parse(rewritten.contents.as_slice()).unwrap();
+        let metadata = root.get_child("metadata").unwrap();
+        let dependencies = metadata.get_child("dependencies").unwrap();
+        let group = dependencies.get_child("group").unwrap();
+
+        assert_eq!(dependency_version(group, "B"), Some("2.5.0"));
+        assert_eq!(dependency_version(group, "C"), Some("3.1.0"));
+        assert_eq!(dependency_version(group, "External"), Some("9.9.9"));
     }
 
     #[test]
@@ -906,6 +1077,7 @@ mod tests {
             package_version: None,
             version_suffix: Some("ci.4".to_string()),
             prefix_version: None,
+            rewrite_workspace_dependency_versions: None,
             skip_duplicate: Some(true),
             dry_run: Some(true),
         };
@@ -921,6 +1093,7 @@ mod tests {
                 suffix: "ci.4".to_string(),
             })
         );
+        assert!(resolved.rewrite_workspace_dependency_versions);
         assert!(resolved.skip_duplicate);
         assert!(resolved.dry_run);
     }
@@ -934,6 +1107,7 @@ mod tests {
             directories: vec![temp_dir.path().to_path_buf()],
             package_version: Some("2.0.0".to_string()),
             prefix_version: None,
+            no_rewrite_workspace_dependency_versions: true,
             skip_duplicate: true,
             dry_run: true,
             ..cli_with_defaults()
@@ -945,6 +1119,7 @@ mod tests {
             package_version: Some("1.0.0".to_string()),
             version_suffix: None,
             prefix_version: None,
+            rewrite_workspace_dependency_versions: Some(true),
             skip_duplicate: Some(false),
             dry_run: Some(false),
         };
@@ -957,6 +1132,7 @@ mod tests {
             resolved.version_rewrite,
             Some(VersionRewrite::Exact("2.0.0".to_string()))
         );
+        assert!(!resolved.rewrite_workspace_dependency_versions);
         assert!(resolved.skip_duplicate);
         assert!(resolved.dry_run);
     }
@@ -970,6 +1146,7 @@ mod tests {
             package_version: Some("1.0.0".to_string()),
             version_suffix: Some("ci.1".to_string()),
             prefix_version: None,
+            rewrite_workspace_dependency_versions: None,
             skip_duplicate: None,
             dry_run: None,
         };
@@ -998,6 +1175,7 @@ mod tests {
             package_version: None,
             version_suffix: Some("ci.7".to_string()),
             prefix_version: Some("5.4.3".to_string()),
+            rewrite_workspace_dependency_versions: None,
             skip_duplicate: None,
             dry_run: None,
         };
@@ -1021,6 +1199,7 @@ mod tests {
             package_version: Some("1.0.0".to_string()),
             version_suffix: None,
             prefix_version: Some("2.0.0".to_string()),
+            rewrite_workspace_dependency_versions: None,
             skip_duplicate: None,
             dry_run: None,
         };
@@ -1038,5 +1217,17 @@ mod tests {
         if let Some(path) = global_config_path() {
             assert!(path.ends_with(Path::new("pdupload/pdupload.toml")));
         }
+    }
+
+    fn dependency_version<'a>(group: &'a Element, dependency_id: &str) -> Option<&'a str> {
+        group.children.iter().find_map(|child| match child {
+            xmltree::XMLNode::Element(element)
+                if element.name == "dependency"
+                    && element.attributes.get("id").map(String::as_str) == Some(dependency_id) =>
+            {
+                element.attributes.get("version").map(String::as_str)
+            }
+            _ => None,
+        })
     }
 }

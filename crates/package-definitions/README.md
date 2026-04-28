@@ -10,6 +10,7 @@ It is useful when the workflow is "find a pile of `.nupkg` files, adjust version
 - Reads default settings from `pdupload.toml`.
 - Supports exact version replacement with `--package-version`.
 - Supports suffix-only rewrites with `--version-suffix` and `--prefix-version`.
+- Rewrites dependency versions for other detected workspace packages by default.
 - Pushes packages with `dotnet nuget push`.
 - Can skip duplicates and perform dry runs.
 
@@ -46,6 +47,8 @@ Rewrite only the suffix while preserving the existing prefix version:
 cargo run -p pdupload -- --source MyFeed --version-suffix=ci.4
 ```
 
+When version rewriting is enabled, `pdupload` also rewrites dependency version attributes that point at other `.nupkg` files detected in the same scan roots. Pass `--no-rewrite-workspace-dependency-versions` to keep those dependency versions unchanged.
+
 Rewrite only the suffix while forcing the prefix version:
 
 ```powershell
@@ -78,5 +81,6 @@ api_key = "super-secret-key"
 directories = ["bin/nuget", "package"]
 prefix_version = "2.1.0"
 version_suffix = ""
+rewrite_workspace_dependency_versions = true
 skip_duplicate = true
 ```
