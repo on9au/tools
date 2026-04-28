@@ -75,6 +75,7 @@ struct PackageUpload {
     upload_path: PathBuf,
     package_id: Option<String>,
     package_version: Option<String>,
+    dependency_rewrites: Vec<DependencyRewrite>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +91,13 @@ struct PushResult {
 struct PackageIdentity {
     package_id: String,
     version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DependencyRewrite {
+    dependency_id: String,
+    previous_version: String,
+    rewritten_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -419,6 +427,7 @@ fn prepare_uploads(
                 upload_path: package_path.clone(),
                 package_id: None,
                 package_version: None,
+                dependency_rewrites: Vec::new(),
             }),
         })
         .collect()
@@ -441,6 +450,7 @@ fn repack_package_with_version(
     })?;
 
     let mut package_identity = None;
+    let mut dependency_rewrites = Vec::new();
     let output_path = output_directory.join(temp_package_name(package_path)?);
     let output_file = File::create(&output_path)
         .with_context(|| format!("failed to create {}", output_path.display()))?;
@@ -481,6 +491,7 @@ fn repack_package_with_version(
         if entry_name.ends_with(".nuspec") {
             let updated_nuspec =
                 rewrite_nuspec_version(&bytes, version_rewrite, workspace_dependency_versions)?;
+            dependency_rewrites = updated_nuspec.dependency_rewrites.clone();
             package_identity = Some(updated_nuspec.identity.clone());
             writer
                 .write_all(&updated_nuspec.contents)
@@ -527,6 +538,7 @@ fn repack_package_with_version(
         upload_path: renamed_output_path,
         package_id: Some(package_identity.package_id),
         package_version: Some(package_identity.version),
+        dependency_rewrites,
     })
 }
 
@@ -584,9 +596,12 @@ fn rewrite_nuspec_version(
         .ok_or_else(|| anyhow!("nuspec metadata does not contain a version element"))?;
     let package_version = resolve_package_version(&current_version, version_rewrite)?;
     set_child_text(metadata, "version", &package_version)?;
-    if let Some(workspace_dependency_versions) = workspace_dependency_versions {
-        rewrite_dependency_versions(metadata, workspace_dependency_versions);
-    }
+    let dependency_rewrites =
+        if let Some(workspace_dependency_versions) = workspace_dependency_versions {
+            collect_and_rewrite_dependency_versions(metadata, workspace_dependency_versions)
+        } else {
+            Vec::new()
+        };
 
     let mut contents = Vec::new();
     root.write_with_config(
@@ -602,6 +617,7 @@ fn rewrite_nuspec_version(
             package_id,
             version: package_version.to_string(),
         },
+        dependency_rewrites,
         contents,
     })
 }
@@ -683,24 +699,43 @@ fn rewritten_package_identity(
     })
 }
 
-fn rewrite_dependency_versions(
+fn collect_and_rewrite_dependency_versions(
     element: &mut Element,
     workspace_dependency_versions: &HashMap<String, String>,
-) {
+) -> Vec<DependencyRewrite> {
+    let mut dependency_rewrites = Vec::new();
+
     if element.name == "dependency"
-        && let Some(dependency_id) = element.attributes.get("id")
-        && let Some(rewritten_version) = workspace_dependency_versions.get(dependency_id)
+        && let Some(dependency_id) = element.attributes.get("id").cloned()
+        && let Some(rewritten_version) = workspace_dependency_versions.get(&dependency_id)
     {
-        element
+        let previous_version = element
             .attributes
-            .insert("version".to_string(), rewritten_version.clone());
+            .get("version")
+            .cloned()
+            .unwrap_or_default();
+        if previous_version != *rewritten_version {
+            element
+                .attributes
+                .insert("version".to_string(), rewritten_version.clone());
+            dependency_rewrites.push(DependencyRewrite {
+                dependency_id,
+                previous_version,
+                rewritten_version: rewritten_version.clone(),
+            });
+        }
     }
 
     for child in &mut element.children {
         if let XMLNode::Element(child_element) = child {
-            rewrite_dependency_versions(child_element, workspace_dependency_versions);
+            dependency_rewrites.extend(collect_and_rewrite_dependency_versions(
+                child_element,
+                workspace_dependency_versions,
+            ));
         }
     }
+
+    dependency_rewrites
 }
 
 fn validate_version_arguments(cli: &Cli) -> Result<()> {
@@ -885,6 +920,7 @@ fn render_upload_summary(
         );
         let _ = writeln!(summary, "  source: {}", upload.source_path.display());
         let _ = writeln!(summary, "  upload: {}", upload.upload_path.display());
+        append_dependency_rewrite_block(&mut summary, &upload.dependency_rewrites);
 
         if let Some(result) = push_result {
             let exit_code = result
@@ -900,6 +936,31 @@ fn render_upload_summary(
     }
 
     summary
+}
+
+fn append_dependency_rewrite_block(
+    summary: &mut String,
+    dependency_rewrites: &[DependencyRewrite],
+) {
+    if dependency_rewrites.is_empty() {
+        return;
+    }
+
+    let _ = writeln!(summary, "  dependency rewrites:");
+    for dependency_rewrite in dependency_rewrites {
+        let previous_version = if dependency_rewrite.previous_version.is_empty() {
+            "(missing)"
+        } else {
+            dependency_rewrite.previous_version.as_str()
+        };
+        let _ = writeln!(
+            summary,
+            "    {}: {} -> {}",
+            dependency_rewrite.dependency_id,
+            previous_version,
+            dependency_rewrite.rewritten_version
+        );
+    }
 }
 
 fn display_upload_identity(upload: &PackageUpload) -> String {
@@ -995,16 +1056,17 @@ fn display_paths(paths: &[PathBuf]) -> String {
 #[derive(Debug)]
 struct RewrittenNuspec {
     identity: PackageIdentity,
+    dependency_rewrites: Vec<DependencyRewrite>,
     contents: Vec<u8>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SUFFIX_TOKEN_WIDTH, PackageIdentity, PackageUpload, PduploadConfig, PushResult,
-        VersionRewrite, candidate_config_paths, child_text, default_suffix_token,
-        default_version_suffix, display_paths, global_config_path, is_uploadable_package,
-        package_file_name, render_upload_summary, resolve_options,
+        DEFAULT_SUFFIX_TOKEN_WIDTH, DependencyRewrite, PackageIdentity, PackageUpload,
+        PduploadConfig, PushResult, VersionRewrite, candidate_config_paths, child_text,
+        default_suffix_token, default_version_suffix, display_paths, global_config_path,
+        is_uploadable_package, package_file_name, render_upload_summary, resolve_options,
         resolve_version_rewrite_from_config, rewrite_nuspec_version, version_prefix,
     };
     use std::collections::HashMap;
@@ -1054,6 +1116,7 @@ mod tests {
 
         assert_eq!(rewritten.identity.package_id, "Example.Package");
         assert_eq!(rewritten.identity.version, "2.5.0");
+        assert!(rewritten.dependency_rewrites.is_empty());
         assert_eq!(
             child_text(metadata, "version").unwrap().as_deref(),
             Some("2.5.0")
@@ -1137,6 +1200,21 @@ mod tests {
         let dependencies = metadata.get_child("dependencies").unwrap();
         let group = dependencies.get_child("group").unwrap();
 
+        assert_eq!(
+            rewritten.dependency_rewrites,
+            vec![
+                DependencyRewrite {
+                    dependency_id: "B".to_string(),
+                    previous_version: "[1.0.0]".to_string(),
+                    rewritten_version: "2.5.0".to_string(),
+                },
+                DependencyRewrite {
+                    dependency_id: "C".to_string(),
+                    previous_version: "2.0.0".to_string(),
+                    rewritten_version: "3.1.0".to_string(),
+                },
+            ]
+        );
         assert_eq!(dependency_version(group, "B"), Some("2.5.0"));
         assert_eq!(dependency_version(group, "C"), Some("3.1.0"));
         assert_eq!(dependency_version(group, "External"), Some("9.9.9"));
@@ -1165,6 +1243,11 @@ mod tests {
             upload_path: PathBuf::from("temp/A.2.0.0.nupkg"),
             package_id: Some("A".to_string()),
             package_version: Some("2.0.0".to_string()),
+            dependency_rewrites: vec![DependencyRewrite {
+                dependency_id: "B".to_string(),
+                previous_version: "[1.0.0]".to_string(),
+                rewritten_version: "2.0.0".to_string(),
+            }],
         };
         let push_result = PushResult {
             upload: upload.clone(),
@@ -1179,6 +1262,8 @@ mod tests {
         assert!(summary.contains("Upload Summary"));
         assert!(summary.contains("[1/1] OK A 2.0.0"));
         assert!(summary.contains("Succeeded: 1"));
+        assert!(summary.contains("dependency rewrites:"));
+        assert!(summary.contains("B: [1.0.0] -> 2.0.0"));
         assert!(summary.contains("stdout:"));
         assert!(summary.contains("Pushing A.2.0.0.nupkg"));
         assert!(summary.contains("stderr:\n    (none)"));
@@ -1191,6 +1276,7 @@ mod tests {
             upload_path: PathBuf::from("bin/nuget/B.1.0.0.nupkg"),
             package_id: Some("B".to_string()),
             package_version: Some("1.0.0".to_string()),
+            dependency_rewrites: Vec::new(),
         };
 
         let summary = render_upload_summary(&[upload], "MyFeed", None, true);
