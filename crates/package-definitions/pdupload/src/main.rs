@@ -7,9 +7,12 @@ use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::process::{Command, ExitCode};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table, presets::UTF8_FULL};
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 use tempfile::TempDir;
 use time::OffsetDateTime;
@@ -179,21 +182,54 @@ fn try_main() -> Result<()> {
     })?;
 
     let mut push_results = Vec::with_capacity(uploads.len());
-    for upload in &uploads {
+    let progress_bar = new_push_progress_bar(uploads.len())?;
+    for (index, upload) in uploads.iter().enumerate() {
+        let current = index + 1;
+        let package_label = display_upload_identity(upload);
+        progress_bar.set_message(format!(
+            "[{current}/{}] pushing {package_label}",
+            uploads.len()
+        ));
+        progress_bar.println(format!(
+            "Starting [{current}/{}] {package_label}",
+            uploads.len()
+        ));
+
         push_results.push(push_package(
             upload,
             &resolved.source,
             api_key,
             resolved.skip_duplicate,
         )?);
-    }
 
-    print_upload_summary(&uploads, &resolved.source, Some(&push_results), false);
+        let result = push_results
+            .last()
+            .expect("push result was just inserted into the collection");
+        progress_bar.println(format!(
+            "{} [{current}/{}] {}",
+            if result.succeeded { "OK" } else { "FAILED" },
+            uploads.len(),
+            package_label
+        ));
+        progress_bar.inc(1);
+    }
 
     let failed_uploads = push_results
         .iter()
         .filter(|result| !result.succeeded)
         .count();
+    progress_bar.finish_with_message(if failed_uploads == 0 {
+        format!("push complete: {} package(s) uploaded", uploads.len())
+    } else {
+        format!(
+            "push complete: {} succeeded, {} failed",
+            uploads.len() - failed_uploads,
+            failed_uploads
+        )
+    });
+
+    print_upload_summary(&uploads, &resolved.source, Some(&push_results), false);
+
     if failed_uploads > 0 {
         bail!("dotnet nuget push failed for {failed_uploads} package(s)");
     }
@@ -890,17 +926,24 @@ fn render_upload_summary(
 
     let _ = writeln!(summary, "Upload Summary");
     let _ = writeln!(summary, "==============");
-    let _ = writeln!(summary, "Source: {source}");
     let _ = writeln!(
         summary,
-        "Mode: {}",
-        if dry_run { "dry run" } else { "push" }
+        "{}",
+        render_summary_overview_table(
+            source,
+            dry_run,
+            total_uploads,
+            push_results.is_some(),
+            succeeded_uploads,
+            failed_uploads,
+        )
     );
-    let _ = writeln!(summary, "Packages: {total_uploads}");
-    if let Some(_) = push_results {
-        let _ = writeln!(summary, "Succeeded: {succeeded_uploads}");
-        let _ = writeln!(summary, "Failed: {failed_uploads}");
-    }
+    let _ = writeln!(summary);
+    let _ = writeln!(
+        summary,
+        "{}",
+        render_package_summary_table(uploads, push_results)
+    );
     let _ = writeln!(summary);
 
     for (index, upload) in uploads.iter().enumerate() {
@@ -936,6 +979,93 @@ fn render_upload_summary(
     }
 
     summary
+}
+
+fn render_summary_overview_table(
+    source: &str,
+    dry_run: bool,
+    total_uploads: usize,
+    has_push_results: bool,
+    succeeded_uploads: usize,
+    failed_uploads: usize,
+) -> Table {
+    let mut table = new_summary_table(["Field", "Value"]);
+    table.add_row(vec!["Source".to_string(), source.to_string()]);
+    table.add_row(vec![
+        "Mode".to_string(),
+        if dry_run {
+            "dry run".to_string()
+        } else {
+            "push".to_string()
+        },
+    ]);
+    table.add_row(vec!["Packages".to_string(), total_uploads.to_string()]);
+    if has_push_results {
+        table.add_row(vec!["Succeeded".to_string(), succeeded_uploads.to_string()]);
+        table.add_row(vec!["Failed".to_string(), failed_uploads.to_string()]);
+    }
+    table
+}
+
+fn render_package_summary_table(
+    uploads: &[PackageUpload],
+    push_results: Option<&[PushResult]>,
+) -> Table {
+    let mut table = new_summary_table(["#", "Status", "Package", "Version", "Dependency Rewrites"]);
+
+    for (index, upload) in uploads.iter().enumerate() {
+        let push_result = push_results.and_then(|results| results.get(index));
+        let status_label = match push_result {
+            Some(result) if result.succeeded => "OK",
+            Some(_) => "FAILED",
+            None => "PLANNED",
+        };
+        table.add_row(vec![
+            (index + 1).to_string(),
+            status_label.to_string(),
+            display_upload_name(upload),
+            display_upload_version(upload),
+            upload.dependency_rewrites.len().to_string(),
+        ]);
+    }
+
+    table
+}
+
+fn new_push_progress_bar(total_uploads: usize) -> Result<ProgressBar> {
+    let progress_bar = ProgressBar::new(total_uploads as u64);
+    let style = ProgressStyle::with_template("{spinner:.cyan} [{pos}/{len}] {msg}")
+        .context("failed to configure push progress style")?;
+    progress_bar.set_style(style);
+    progress_bar.enable_steady_tick(Duration::from_millis(120));
+    Ok(progress_bar)
+}
+
+fn new_summary_table<const N: usize>(headers: [&str; N]) -> Table {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(headers.into_iter().map(|header| {
+            Cell::new(header)
+                .fg(Color::Cyan)
+                .add_attribute(Attribute::Bold)
+        }));
+    table
+}
+
+fn display_upload_name(upload: &PackageUpload) -> String {
+    upload
+        .package_id
+        .clone()
+        .unwrap_or_else(|| display_upload_identity(upload))
+}
+
+fn display_upload_version(upload: &PackageUpload) -> String {
+    upload
+        .package_version
+        .clone()
+        .unwrap_or_else(|| "(unchanged)".to_string())
 }
 
 fn append_dependency_rewrite_block(
@@ -1260,8 +1390,12 @@ mod tests {
         let summary = render_upload_summary(&[upload], "MyFeed", Some(&[push_result]), false);
 
         assert!(summary.contains("Upload Summary"));
+        assert!(summary.contains("Field"));
+        assert!(summary.contains("Status"));
+        assert!(summary.contains("Dependency Rewrites"));
         assert!(summary.contains("[1/1] OK A 2.0.0"));
-        assert!(summary.contains("Succeeded: 1"));
+        assert!(summary.contains("Succeeded"));
+        assert!(summary.contains("MyFeed"));
         assert!(summary.contains("dependency rewrites:"));
         assert!(summary.contains("B: [1.0.0] -> 2.0.0"));
         assert!(summary.contains("stdout:"));
@@ -1281,7 +1415,9 @@ mod tests {
 
         let summary = render_upload_summary(&[upload], "MyFeed", None, true);
 
-        assert!(summary.contains("Mode: dry run"));
+        assert!(summary.contains("Mode"));
+        assert!(summary.contains("dry run"));
+        assert!(summary.contains("PLANNED"));
         assert!(summary.contains("[1/1] PLANNED B 1.0.0"));
         assert!(!summary.contains("stdout:"));
     }
