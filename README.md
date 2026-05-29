@@ -1,16 +1,22 @@
 # on9au's amazing cool tools
 
-This repository contains various tools that I have created for my own use. They are not intended for public use and may not be well-documented or user-friendly. Use them at your own risk.
+This repository contains various tools that I have created for my own use. Originally meant to be for private use, until i recommended one of my tools to someone lmao
 
 ## Workspace overview
 
-This workspace is split into a few tool areas under `crates/`:
-
-- `crates/tool/`: the tool management surface, including `toolctl`
-- `crates/package-definitions/`: package-related utilities such as `pdupload`
-- `crates/migration/`: migration helpers such as `upstream-migration-planner`
+This workspace is split into tool areas under `crates/`:
 
 The top-level README is only a map of the workspace. Tool-specific usage and flags should live in each tool area's own README.
+
+## Install
+
+`toolctl` is the main entrypoint for this repository, and can be used to install other tools in this repository.
+
+Run the following command to install `toolctl`:
+
+```sh
+cargo install --git https://github.com/on9au/tools.git toolctl
+```
 
 ## Start with toolctl
 
@@ -20,7 +26,7 @@ Use it to sync this repository locally, discover installable tools, inspect rece
 
 Common commands:
 
-```powershell
+```sh
 cargo run -p toolctl -- doctor
 cargo run -p toolctl -- sync
 cargo run -p toolctl -- list available
@@ -42,7 +48,7 @@ Use the README in each tool area for details:
 
 Build the workspace:
 
-```powershell
+```sh
 cargo build
 ```
 
@@ -53,5 +59,3 @@ The version model is repo-native rather than semver-heavy:
 - available versions come from git commits affecting the tool's package directory
 - installs record the exact commit hash and commit date
 - `toolctl` can rebuild an older version by checking out that commit in a temporary worktree
-
-That is a better fit for a personal tools repo where the source of truth is this repository history. 
