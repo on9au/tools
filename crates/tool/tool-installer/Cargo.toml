@@ -3,6 +3,7 @@ name = "tool-installer"
 version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [dependencies]
 tool-core.workspace = true
