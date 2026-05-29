@@ -312,13 +312,12 @@ fn resolve_managed_bin_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(bin_dir));
     }
 
-    if let Some(current_exe_bin_dir) = current_exe_bin_dir()? {
-        if is_directory_on_path(&current_exe_bin_dir)
+    if let Some(current_exe_bin_dir) = current_exe_bin_dir()?
+        && is_directory_on_path(&current_exe_bin_dir)
             && !looks_like_cargo_target_bin_dir(&current_exe_bin_dir)
         {
             return Ok(current_exe_bin_dir);
         }
-    }
 
     cargo_bin_dir()
 }
@@ -341,11 +340,10 @@ fn user_home_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(home_dir));
     }
 
-    if cfg!(windows) {
-        if let Some(user_profile) = env::var_os("USERPROFILE") {
+    if cfg!(windows)
+        && let Some(user_profile) = env::var_os("USERPROFILE") {
             return Ok(PathBuf::from(user_profile));
         }
-    }
 
     bail!("could not determine a home directory for the Cargo bin path")
 }
