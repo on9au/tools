@@ -89,7 +89,10 @@ mod win {
 
         let files = collect_files(&path)?;
         if files.is_empty() {
-            println!("Nothing to inspect: `{}` contains no files.", path.display());
+            println!(
+                "Nothing to inspect: `{}` contains no files.",
+                path.display()
+            );
             return Ok(());
         }
 
@@ -119,10 +122,7 @@ mod win {
                 return Ok(());
             }
 
-            println!(
-                "Processes holding a lock on `{}`:\n",
-                path.display()
-            );
+            println!("Processes holding a lock on `{}`:\n", path.display());
             print_table(&procs);
 
             if cli.list {
@@ -138,7 +138,10 @@ mod win {
             match cli.severity {
                 Severity::Graceful => {
                     check(unsafe { RmShutdown(session, 0, None) }, "RmShutdown")?;
-                    println!("Requested graceful shutdown of {} process(es).", procs.len());
+                    println!(
+                        "Requested graceful shutdown of {} process(es).",
+                        procs.len()
+                    );
                 }
                 Severity::Forced => {
                     check(
@@ -259,7 +262,10 @@ mod win {
         io::stdin()
             .read_line(&mut answer)
             .context("failed to read confirmation")?;
-        Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+        Ok(matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
     }
 
     /// Human-readable label for the Restart Manager application type.
