@@ -6,7 +6,7 @@ members = [
 	"crates/tool/tool-installer",
 	"crates/package-definitions/pdupload",
 	"crates/migration/upstream-migration-planner",
-	"crates/windows/reaper",
+	"crates/fs/reaper",
 ]
 
 [workspace.package]
