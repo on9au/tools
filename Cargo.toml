@@ -7,6 +7,7 @@ members = [
 	"crates/package-definitions/pdupload",
 	"crates/migration/upstream-migration-planner",
 	"crates/fs/reaper",
+	"crates/git/cdgit",
 ]
 
 [workspace.package]

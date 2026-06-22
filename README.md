@@ -43,6 +43,7 @@ Use the README in each tool area for details:
 - [crates/tool/README.md](crates/tool/README.md): tool management utilities, especially `toolctl`
 - [crates/package-definitions/README.md](crates/package-definitions/README.md): package utilities, currently `pdupload`
 - [crates/migration/README.md](crates/migration/README.md): migration utilities, currently `upstream-migration-planner`
+- [crates/git/README.md](crates/git/README.md): git utilities, currently `cdgit`
 
 ## Build
 
